@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn normalize_path_for_skill_id_user_scoped_uses_absolute_path() {
-        let skill_path = PathBuf::from("/Users/abc/.codex/skills/doc/SKILL.md");
+        let skill_path = PathBuf::from("/Users/abc/.codey/skills/doc/SKILL.md");
 
         let path = normalize_path_for_skill_id(None, None, skill_path.as_path());
         let expected = expected_absolute_path(&skill_path);

@@ -60,10 +60,26 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
         .collect()
 }
 
-fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+fn sanitize_rendered_lines(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
-        .map(|line| {
+        .map(|mut line| {
+            if let (Some(version_pos), Some(pipe_idx)) =
+                (line.find("OpenAI Codex (v"), line.rfind('│'))
+            {
+                let prefix = &line[..version_pos];
+                let suffix = &line[pipe_idx..];
+                let content_width = pipe_idx.saturating_sub(version_pos);
+                let replacement = "OpenAI Codex (v0.0.0)";
+                let mut rebuilt = prefix.to_string();
+                rebuilt.push_str(replacement);
+                if content_width > replacement.len() {
+                    rebuilt.push_str(&" ".repeat(content_width - replacement.len()));
+                }
+                rebuilt.push_str(suffix);
+                line = rebuilt;
+            }
+
             if let (Some(dir_pos), Some(pipe_idx)) = (line.find("Directory: "), line.rfind('│')) {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
                 let suffix = &line[pipe_idx..];
@@ -162,7 +178,7 @@ async fn status_snapshot_includes_reasoning_details() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -216,7 +232,7 @@ async fn status_snapshot_includes_forked_from() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -276,7 +292,7 @@ async fn status_snapshot_includes_monthly_limit() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -568,7 +584,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
 
     assert_snapshot!(sanitized);
 }
@@ -617,7 +633,7 @@ async fn status_snapshot_shows_missing_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -684,7 +700,7 @@ async fn status_snapshot_includes_credits_and_limits() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -739,7 +755,7 @@ async fn status_snapshot_shows_empty_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -803,7 +819,7 @@ async fn status_snapshot_shows_stale_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -871,7 +887,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 

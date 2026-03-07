@@ -29,7 +29,7 @@ pub(crate) use crate::runtime::network_proxy_state_for_policy;
 pub(crate) async fn build_config_state() -> Result<ConfigState> {
     // Load config through `codex-core` so we inherit the same layer ordering and semantics as the
     // rest of Codex (system/managed layers, user layers, session flags, etc.).
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home().context("failed to resolve CODEY_HOME")?;
     let cli_overrides = Vec::new();
     let overrides = LoaderOverrides::default();
     let config_layer_stack = load_config_layers_state(

@@ -54,7 +54,7 @@ where
     let transport = TokioChildProcess::new(Command::new(&mcp_executable).configure(|cmd| {
         cmd.arg("--bash").arg(bash);
         cmd.arg("--execve").arg(&execve_wrapper);
-        cmd.env("CODEX_HOME", codex_home.as_ref());
+        cmd.env("CODEY_HOME", codex_home.as_ref());
         cmd.env("DOTSLASH_CACHE", dotslash_cache.as_ref());
 
         // Important: pipe stdio so rmcp can speak JSON-RPC over stdin/stdout

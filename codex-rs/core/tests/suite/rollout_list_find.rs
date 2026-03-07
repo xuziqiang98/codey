@@ -68,9 +68,9 @@ async fn find_locates_rollout_file_by_id() {
 #[tokio::test]
 async fn find_handles_gitignore_covering_codex_home_directory() {
     let repo = TempDir::new().unwrap();
-    let codex_home = repo.path().join(".codex");
+    let codex_home = repo.path().join(".codey");
     std::fs::create_dir_all(&codex_home).unwrap();
-    std::fs::write(repo.path().join(".gitignore"), ".codex/**\n").unwrap();
+    std::fs::write(repo.path().join(".gitignore"), ".codey/**\n").unwrap();
     let id = Uuid::new_v4();
     let expected = write_minimal_rollout_with_id(&codex_home, id);
 

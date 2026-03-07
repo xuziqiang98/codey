@@ -26,11 +26,11 @@ use crate::state::ReaderEvent;
 #[derive(Parser)]
 #[command(author = "Codex", version, about = "Minimal app-server client")]
 struct Cli {
-    /// Path to the `codex` CLI binary.
-    #[arg(long, default_value = "codex")]
+    /// Path to the `codey` CLI binary.
+    #[arg(long, default_value = "codey")]
     codex_bin: String,
 
-    /// Forwarded to the `codex` CLI as `--config key=value`. Repeatable.
+    /// Forwarded to the `codey` CLI as `--config key=value`. Repeatable.
     #[arg(short = 'c', long = "config", value_name = "key=value", action = ArgAction::Append)]
     config_overrides: Vec<String>,
 
