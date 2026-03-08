@@ -3731,10 +3731,13 @@ impl ChatWidget {
     }
 
     fn lower_cost_preset(&self) -> Option<ModelPreset> {
-        let models = self.models_manager.try_list_models(&self.config).ok()?;
+        let models = self
+            .models_manager
+            .try_list_picker_models(&self.config)
+            .ok()?;
         models
             .iter()
-            .find(|preset| preset.show_in_picker && preset.model == NUDGE_MODEL_SLUG)
+            .find(|preset| preset.model == NUDGE_MODEL_SLUG)
             .cloned()
     }
 
@@ -3848,16 +3851,18 @@ impl ChatWidget {
             return;
         }
 
-        let presets: Vec<ModelPreset> = match self.models_manager.try_list_models(&self.config) {
-            Ok(models) => models,
-            Err(_) => {
-                self.add_info_message(
-                    "Models are being updated; please try /model again in a moment.".to_string(),
-                    None,
-                );
-                return;
-            }
-        };
+        let presets: Vec<ModelPreset> =
+            match self.models_manager.try_list_picker_models(&self.config) {
+                Ok(models) => models,
+                Err(_) => {
+                    self.add_info_message(
+                        "Models are being updated; please try /model again in a moment."
+                            .to_string(),
+                        None,
+                    );
+                    return;
+                }
+            };
         self.open_model_popup_with_presets(presets);
     }
 
@@ -5215,7 +5220,7 @@ impl ChatWidget {
     fn current_model_supports_personality(&self) -> bool {
         let model = self.current_model();
         self.models_manager
-            .try_list_models(&self.config)
+            .try_list_picker_models(&self.config)
             .ok()
             .and_then(|models| {
                 models

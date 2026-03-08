@@ -2,8 +2,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
+use app_test_support::write_chatgpt_auth;
+use app_test_support::write_mock_responses_config_toml;
 use app_test_support::write_models_cache;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -12,8 +15,11 @@ use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
+use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::features::Feature;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -286,5 +292,111 @@ async fn list_models_rejects_invalid_cursor() -> Result<()> {
     assert_eq!(error.id, RequestId::Integer(request_id));
     assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(error.error.message, "invalid cursor: invalid");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_models_without_auth_returns_only_configured_custom_model() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        "http://unused.test",
+        &BTreeMap::from([(Feature::RemoteModels, false)]),
+        10_000,
+        Some(false),
+        "mock_provider",
+        "compact",
+    )?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(100),
+            cursor: None,
+        })
+        .await?;
+
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    let ModelListResponse {
+        data: items,
+        next_cursor,
+    } = to_response::<ModelListResponse>(response)?;
+
+    assert_eq!(
+        items,
+        vec![Model {
+            id: "mock-model".to_string(),
+            model: "mock-model".to_string(),
+            display_name: "mock-model".to_string(),
+            description: "Configured model from config.toml for provider mock_provider."
+                .to_string(),
+            supported_reasoning_efforts: vec![],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supports_personality: false,
+            is_default: true,
+        }]
+    );
+    assert!(next_cursor.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_models_with_auth_appends_configured_custom_model() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        "http://unused.test",
+        &BTreeMap::from([(Feature::RemoteModels, false)]),
+        10_000,
+        Some(false),
+        "mock_provider",
+        "compact",
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-access"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(100),
+            cursor: None,
+        })
+        .await?;
+
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    let ModelListResponse { data: items, .. } = to_response::<ModelListResponse>(response)?;
+
+    assert_eq!(items.len(), 5);
+    assert_eq!(
+        items.first().map(|model| model.model.as_str()),
+        Some("gpt-5.2-codex")
+    );
+    assert_eq!(
+        items.last().map(|model| model.model.as_str()),
+        Some("mock-model")
+    );
+    assert_eq!(
+        items.last().map(|model| model.description.as_str()),
+        Some("Configured model from config.toml for provider mock_provider.")
+    );
     Ok(())
 }

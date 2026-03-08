@@ -158,6 +158,17 @@ impl ThreadManager {
             .await
     }
 
+    pub async fn list_picker_models(
+        &self,
+        config: &Config,
+        refresh_strategy: crate::models_manager::manager::RefreshStrategy,
+    ) -> Vec<ModelPreset> {
+        self.state
+            .models_manager
+            .list_picker_models(config, refresh_strategy)
+            .await
+    }
+
     pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
         self.state.models_manager.list_collaboration_modes()
     }

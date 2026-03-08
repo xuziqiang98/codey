@@ -39,6 +39,8 @@ const REMOTE_MODEL: &str = "codex-test-ttl";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = MockServer::start().await;
 
     let remote_model = test_remote_model(REMOTE_MODEL, 1);

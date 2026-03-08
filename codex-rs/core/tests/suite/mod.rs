@@ -8,10 +8,7 @@ use tempfile::TempDir;
 // based on the arg0.
 // NOTE: this doesn't work on ARM
 #[ctor]
-pub static CODEX_ALIASES_TEMP_DIR: TempDir = unsafe {
-    #[allow(clippy::unwrap_used)]
-    arg0_dispatch().unwrap()
-};
+pub static CODEX_ALIASES_TEMP_DIR: Option<TempDir> = unsafe { arg0_dispatch() };
 
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;

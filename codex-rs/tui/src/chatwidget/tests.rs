@@ -17,6 +17,7 @@ use assert_matches::assert_matches;
 use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
@@ -3070,6 +3071,34 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
     assert!(
         !popup.contains("test-hidden-model"),
         "expected hidden model to be excluded from picker:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_without_auth_shows_only_configured_custom_model() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.auth_manager = Arc::new(AuthManager::new(
+        chat.config.codex_home.clone(),
+        false,
+        AuthCredentialsStoreMode::File,
+    ));
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+    ));
+    chat.config.model_provider_id = "mock_provider".to_string();
+
+    chat.open_model_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("mock-model"),
+        "expected configured custom model to appear in picker:\n{popup}"
+    );
+    assert!(
+        !popup.contains("gpt-5.2-codex"),
+        "expected built-in picker models to be hidden without auth:\n{popup}"
     );
 }
 

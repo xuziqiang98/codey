@@ -18,6 +18,7 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use http::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,6 +89,20 @@ impl ModelsManager {
         self.build_available_models(remote_models)
     }
 
+    /// List the models that should be shown in picker UIs.
+    ///
+    /// Includes the current configured model when it is not otherwise visible in
+    /// the picker. Without any configured auth, the picker collapses down to the
+    /// configured model when one is present.
+    pub async fn list_picker_models(
+        &self,
+        config: &Config,
+        refresh_strategy: RefreshStrategy,
+    ) -> Vec<ModelPreset> {
+        let available_models = self.list_models(config, refresh_strategy).await;
+        self.build_picker_models(config, available_models)
+    }
+
     /// List collaboration mode presets.
     ///
     /// Returns a static set of presets seeded with the configured model.
@@ -101,6 +116,15 @@ impl ModelsManager {
     pub fn try_list_models(&self, config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
         let remote_models = self.try_get_remote_models(config)?;
         Ok(self.build_available_models(remote_models))
+    }
+
+    /// Attempt to list picker-visible models without blocking, using cached state.
+    pub fn try_list_picker_models(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<ModelPreset>, TryLockError> {
+        let available_models = self.try_list_models(config)?;
+        Ok(self.build_picker_models(config, available_models))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -293,6 +317,75 @@ impl ModelsManager {
         merged_presets
     }
 
+    fn build_picker_models(
+        &self,
+        config: &Config,
+        available_models: Vec<ModelPreset>,
+    ) -> Vec<ModelPreset> {
+        let mut picker_models: Vec<ModelPreset> = available_models
+            .into_iter()
+            .filter(|preset| preset.show_in_picker)
+            .collect();
+        let has_auth = self.auth_manager.get_internal_auth_mode().is_some();
+
+        let custom_model = self
+            .configured_picker_model(config, &picker_models)
+            .filter(|preset| {
+                !picker_models
+                    .iter()
+                    .any(|model| model.model == preset.model)
+            });
+
+        match (has_auth, custom_model) {
+            (true, Some(custom_model)) => {
+                picker_models.push(custom_model);
+                picker_models
+            }
+            (true, None) => picker_models,
+            (false, Some(mut custom_model)) => {
+                custom_model.is_default = true;
+                vec![custom_model]
+            }
+            (false, None) => picker_models,
+        }
+    }
+
+    fn configured_picker_model(
+        &self,
+        config: &Config,
+        picker_models: &[ModelPreset],
+    ) -> Option<ModelPreset> {
+        let model = config.model.as_deref()?.trim();
+        if model.is_empty() || picker_models.iter().any(|preset| preset.model == model) {
+            return None;
+        }
+
+        let model_info =
+            model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config);
+        let default_reasoning_effort = config
+            .model_reasoning_effort
+            .or(model_info.default_reasoning_level)
+            .unwrap_or(ReasoningEffort::Medium);
+        let supports_personality = model_info.supports_personality();
+
+        Some(ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: format!(
+                "Configured model from config.toml for provider {}.",
+                config.model_provider_id
+            ),
+            default_reasoning_effort,
+            supported_reasoning_efforts: model_info.supported_reasoning_levels,
+            supports_personality,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+        })
+    }
+
     async fn get_remote_models(&self, config: &Config) -> Vec<ModelInfo> {
         if config.features.enabled(Feature::RemoteModels) {
             self.remote_models.read().await.clone()
@@ -442,6 +535,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_sorts_by_priority() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let remote_models = vec![
             remote_model("priority-low", "Low", 1),
@@ -499,6 +594,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_uses_cache_when_fresh() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let remote_models = vec![remote_model("cached", "Cached", 5)];
         let models_mock = mount_models_once(
@@ -546,6 +643,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_refetches_when_cache_stale() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let initial_models = vec![remote_model("stale", "Stale", 1)];
         let initial_mock = mount_models_once(
@@ -615,6 +714,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_drops_removed_remote_models() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let initial_models = vec![remote_model("remote-old", "Remote Old", 1)];
         let initial_mock = mount_models_once(
@@ -722,6 +823,78 @@ mod tests {
         assert!(
             !response.models.is_empty(),
             "bundled models.json should contain at least one model"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_without_auth_returns_only_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let manager = ModelsManager::new(codex_home.path().to_path_buf(), auth_manager);
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
+        assert_eq!(picker_models[0].display_name, "mock-model");
+        assert_eq!(
+            picker_models[0].description,
+            "Configured model from config.toml for provider mock-provider."
+        );
+        assert!(picker_models[0].is_default);
+        assert!(picker_models[0].show_in_picker);
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_auth_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let manager = ModelsManager::new(codex_home.path().to_path_buf(), auth_manager);
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+        assert_eq!(
+            picker_models
+                .iter()
+                .filter(|preset| preset.is_default)
+                .count(),
+            1
+        );
+        assert!(
+            picker_models
+                .iter()
+                .any(|preset| preset.model == "gpt-5.2-codex" && preset.is_default)
         );
     }
 }
