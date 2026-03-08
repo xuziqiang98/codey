@@ -64,13 +64,12 @@ fn sanitize_rendered_lines(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .map(|mut line| {
-            if let (Some(version_pos), Some(pipe_idx)) =
-                (line.find("OpenAI Codex (v"), line.rfind('│'))
+            if let (Some(version_pos), Some(pipe_idx)) = (line.find("Codey (v"), line.rfind('│'))
             {
                 let prefix = &line[..version_pos];
                 let suffix = &line[pipe_idx..];
                 let content_width = pipe_idx.saturating_sub(version_pos);
-                let replacement = "OpenAI Codex (v0.0.0)";
+                let replacement = "Codey (v0.0.0)";
                 let mut rebuilt = prefix.to_string();
                 rebuilt.push_str(replacement);
                 if content_width > replacement.len() {

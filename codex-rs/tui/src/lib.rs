@@ -493,12 +493,14 @@ async fn run_ratatui_app(
                 exit_reason: ExitReason::UserRequested,
             });
         }
-        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
-        if onboarding_result
-            .directory_trust_decision
-            .map(|d| d == TrustDirectorySelection::Trust)
-            .unwrap_or(false)
-        {
+        let should_reload_config = onboarding_result.config_updated
+            || onboarding_result
+                .directory_trust_decision
+                .map(|d| d == TrustDirectorySelection::Trust)
+                .unwrap_or(false);
+
+        // Reload config if onboarding changed trust or switched to a new provider.
+        if should_reload_config {
             load_config_or_exit(
                 cli_kv_overrides.clone(),
                 overrides.clone(),

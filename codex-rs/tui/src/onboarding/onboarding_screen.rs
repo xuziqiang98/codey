@@ -67,6 +67,7 @@ pub(crate) struct OnboardingScreenArgs {
 
 pub(crate) struct OnboardingResult {
     pub directory_trust_decision: Option<TrustDirectorySelection>,
+    pub config_updated: bool,
     pub should_exit: bool,
 }
 
@@ -194,6 +195,18 @@ impl OnboardingScreen {
 
     pub fn should_exit(&self) -> bool {
         self.should_exit
+    }
+
+    pub fn config_updated(&self) -> bool {
+        self.steps.iter().any(|step| {
+            if let Step::Auth(widget) = step {
+                return widget
+                    .sign_in_state
+                    .read()
+                    .is_ok_and(|g| matches!(&*g, SignInState::ApiKeyConfigured));
+            }
+            false
+        })
     }
 
     fn is_api_key_entry_active(&self) -> bool {
@@ -445,6 +458,7 @@ pub(crate) async fn run_onboarding_app(
     }
     Ok(OnboardingResult {
         directory_trust_decision: onboarding_screen.directory_trust_decision(),
+        config_updated: onboarding_screen.config_updated(),
         should_exit: onboarding_screen.should_exit(),
     })
 }
