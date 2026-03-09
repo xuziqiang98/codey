@@ -7,6 +7,7 @@ use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
 use codex_api::AggregateStreamExt;
 use codex_api::ChatClient as ApiChatClient;
+use codex_api::ChatRequestBuilder as ApiChatRequestBuilder;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::Prompt as ApiPrompt;
@@ -33,10 +34,12 @@ use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -72,6 +75,7 @@ use crate::transport_manager::TransportManager;
 
 pub const WEB_SEARCH_ELIGIBLE_HEADER: &str = "x-oai-web-search-eligible";
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const APPROX_CHARS_PER_TOKEN: usize = 4;
 
 #[derive(Debug)]
 struct ModelClientState {
@@ -276,17 +280,20 @@ impl ModelClientSession {
                 }
             }
             WireApi::Chat => {
-                let api_stream = self.stream_chat_completions(prompt).await?;
+                let (api_stream, estimated_input_tokens) =
+                    self.stream_chat_completions(prompt).await?;
 
                 if self.state.config.show_raw_agent_reasoning {
-                    Ok(map_response_stream(
+                    Ok(map_chat_response_stream(
                         api_stream.streaming_mode(),
                         self.state.otel_manager.clone(),
+                        estimated_input_tokens,
                     ))
                 } else {
-                    Ok(map_response_stream(
+                    Ok(map_chat_response_stream(
                         api_stream.aggregate(),
                         self.state.otel_manager.clone(),
+                        estimated_input_tokens,
                     ))
                 }
             }
@@ -490,7 +497,7 @@ impl ModelClientSession {
     ///
     /// This path is only used when the provider is configured with
     /// `WireApi::Chat`; it does not support `output_schema` today.
-    async fn stream_chat_completions(&self, prompt: &Prompt) -> Result<ApiResponseStream> {
+    async fn stream_chat_completions(&self, prompt: &Prompt) -> Result<(ApiResponseStream, i64)> {
         if prompt.output_schema.is_some() {
             return Err(CodexErr::UnsupportedOperation(
                 "output_schema is not supported for Chat Completions API".to_string(),
@@ -517,22 +524,28 @@ impl ModelClientSession {
                 .provider
                 .to_api_provider(auth.as_ref().map(CodexAuth::internal_auth_mode))?;
             let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+            let request_provider = api_provider.clone();
             let transport = ReqwestTransport::new(build_reqwest_client());
             let (request_telemetry, sse_telemetry) = self.build_streaming_telemetry();
+            let request = ApiChatRequestBuilder::new(
+                &self.state.model_info.slug,
+                &api_prompt.instructions,
+                &api_prompt.input,
+                &api_prompt.tools,
+            )
+            .conversation_id(Some(conversation_id.clone()))
+            .session_source(Some(session_source.clone()))
+            .build(&request_provider)
+            .map_err(map_api_error)?;
+            let estimated_input_tokens =
+                estimate_chat_input_tokens_from_request_body(&request.body);
             let client = ApiChatClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
-            let stream_result = client
-                .stream_prompt(
-                    &self.state.model_info.slug,
-                    &api_prompt,
-                    Some(conversation_id.clone()),
-                    Some(session_source.clone()),
-                )
-                .await;
+            let stream_result = client.stream_request(request).await;
 
             match stream_result {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => return Ok((stream, estimated_input_tokens)),
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UNAUTHORIZED =>
                 {
@@ -794,6 +807,258 @@ where
     ResponseStream { rx_event }
 }
 
+fn map_chat_response_stream<S>(
+    api_stream: S,
+    otel_manager: OtelManager,
+    estimated_input_tokens: i64,
+) -> ResponseStream
+where
+    S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+
+    tokio::spawn(async move {
+        let mut logged_error = false;
+        let mut api_stream = api_stream;
+        let mut estimated_output_tokens = 0i64;
+        while let Some(event) = api_stream.next().await {
+            match event {
+                Ok(ResponseEvent::OutputItemDone(item)) => {
+                    estimated_output_tokens = estimated_output_tokens
+                        .saturating_add(estimate_chat_output_tokens_for_item(&item));
+                    if tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ResponseEvent::Completed {
+                    response_id,
+                    token_usage,
+                }) => {
+                    let token_usage = token_usage.or_else(|| {
+                        let total_tokens =
+                            estimated_input_tokens.saturating_add(estimated_output_tokens);
+                        Some(TokenUsage {
+                            input_tokens: estimated_input_tokens,
+                            cached_input_tokens: 0,
+                            output_tokens: estimated_output_tokens,
+                            reasoning_output_tokens: 0,
+                            total_tokens,
+                        })
+                    });
+                    if let Some(usage) = &token_usage {
+                        otel_manager.sse_event_completed(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            Some(usage.cached_input_tokens),
+                            Some(usage.reasoning_output_tokens),
+                            usage.total_tokens,
+                        );
+                    }
+                    if tx_event
+                        .send(Ok(ResponseEvent::Completed {
+                            response_id,
+                            token_usage,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(event) => {
+                    if tx_event.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let mapped = map_api_error(err);
+                    if !logged_error {
+                        otel_manager.see_event_completed_failed(&mapped);
+                        logged_error = true;
+                    }
+                    if tx_event.send(Err(mapped)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    ResponseStream { rx_event }
+}
+
+fn estimate_chat_input_tokens_from_request_body(body: &Value) -> i64 {
+    let message_chars = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(estimate_chat_message_chars)
+                .fold(0usize, usize::saturating_add)
+        })
+        .unwrap_or(0);
+    let tool_chars = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(estimate_chat_tool_schema_chars)
+                .fold(0usize, usize::saturating_add)
+        })
+        .unwrap_or(0);
+
+    approx_chars_to_tokens(message_chars.saturating_add(tool_chars))
+}
+
+fn estimate_chat_message_chars(message: &Value) -> usize {
+    let content_chars = message
+        .get("content")
+        .map(estimate_chat_message_content_chars)
+        .unwrap_or(0);
+    let reasoning_chars = message
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .map(count_chars)
+        .unwrap_or(0);
+    let tool_call_chars = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|tool_calls| {
+            tool_calls
+                .iter()
+                .map(estimate_chat_tool_call_chars)
+                .fold(0usize, usize::saturating_add)
+        })
+        .unwrap_or(0);
+
+    content_chars
+        .saturating_add(reasoning_chars)
+        .saturating_add(tool_call_chars)
+}
+
+fn estimate_chat_message_content_chars(content: &Value) -> usize {
+    match content {
+        Value::String(text) => count_chars(text),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                let text_chars = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(count_chars)
+                    .unwrap_or(0);
+                let image_chars = item
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .and_then(|image| image.get("url"))
+                    .and_then(Value::as_str)
+                    .map(count_chars)
+                    .unwrap_or(0);
+                text_chars.saturating_add(image_chars)
+            })
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    }
+}
+
+fn estimate_chat_tool_call_chars(tool_call: &Value) -> usize {
+    let Some(object) = tool_call.as_object() else {
+        return 0;
+    };
+
+    if let Some(function) = object.get("function") {
+        return estimate_chat_function_call_chars(function);
+    }
+    if let Some(custom) = object.get("custom") {
+        return estimate_chat_semantic_value_chars(custom);
+    }
+    if let Some(action) = object.get("action") {
+        return object
+            .get("status")
+            .map(estimate_chat_semantic_value_chars)
+            .unwrap_or(0)
+            .saturating_add(estimate_chat_semantic_value_chars(action));
+    }
+
+    object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "id" | "type"))
+        .map(|(_, value)| estimate_chat_semantic_value_chars(value))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_chat_function_call_chars(function: &Value) -> usize {
+    let Some(object) = function.as_object() else {
+        return estimate_chat_semantic_value_chars(function);
+    };
+
+    object
+        .iter()
+        .filter(|(key, _)| matches!(key.as_str(), "name" | "arguments"))
+        .map(|(_, value)| estimate_chat_semantic_value_chars(value))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_chat_tool_schema_chars(tool: &Value) -> usize {
+    count_chars(&serde_json::to_string(tool).unwrap_or_default())
+}
+
+fn estimate_chat_semantic_value_chars(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(boolean) => boolean.to_string().len(),
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => count_chars(text),
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_chat_semantic_value_chars)
+            .fold(0usize, usize::saturating_add),
+        Value::Object(object) => object
+            .values()
+            .map(estimate_chat_semantic_value_chars)
+            .fold(0usize, usize::saturating_add),
+    }
+}
+
+fn estimate_chat_output_tokens_for_item(item: &ResponseItem) -> i64 {
+    let chars = match item {
+        ResponseItem::Message { role, content, .. } if role == "assistant" => content
+            .iter()
+            .map(|content_item| match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    count_chars(text)
+                }
+                ContentItem::InputImage { image_url } => count_chars(image_url),
+            })
+            .fold(0usize, usize::saturating_add),
+        ResponseItem::FunctionCall {
+            name, arguments, ..
+        } => count_chars(name).saturating_add(count_chars(arguments)),
+        _ => 0,
+    };
+
+    approx_chars_to_tokens(chars)
+}
+
+fn approx_chars_to_tokens(chars: usize) -> i64 {
+    let tokens =
+        chars.saturating_add(APPROX_CHARS_PER_TOKEN.saturating_sub(1)) / APPROX_CHARS_PER_TOKEN;
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
+fn count_chars(text: &str) -> usize {
+    text.chars().count()
+}
+
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.
 ///
 /// When refresh succeeds, the caller should retry the API call; otherwise
@@ -878,5 +1143,122 @@ impl WebsocketTelemetry for ApiTelemetry {
         duration: Duration,
     ) {
         self.otel_manager.record_websocket_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ReasoningItemContent;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_chat_input_tokens_counts_semantic_content() {
+        let tool = json!({
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file from disk",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path"
+                    }
+                }
+            }
+        });
+        let body = json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": "inst"},
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning": "why",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"src/lib.rs\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "file body"},
+                        {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+                    ]
+                }
+            ],
+            "stream": true,
+            "tools": [tool]
+        });
+
+        let chars = count_chars("inst")
+            + count_chars("hello")
+            + count_chars("answer")
+            + count_chars("why")
+            + count_chars("read_file")
+            + count_chars("{\"path\":\"src/lib.rs\"}")
+            + count_chars("file body")
+            + count_chars("https://x/y.png")
+            + count_chars(&serde_json::to_string(&tool).unwrap());
+
+        assert_eq!(
+            estimate_chat_input_tokens_from_request_body(&body),
+            approx_chars_to_tokens(chars)
+        );
+    }
+
+    #[test]
+    fn estimate_chat_output_tokens_counts_messages_and_tool_calls() {
+        let assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "hello".to_string(),
+            }],
+            end_turn: None,
+        };
+        let tool_call = ResponseItem::FunctionCall {
+            id: None,
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/lib.rs\"}".to_string(),
+            call_id: "call_1".to_string(),
+        };
+        let reasoning = ResponseItem::Reasoning {
+            id: String::new(),
+            summary: Vec::new(),
+            content: Some(vec![ReasoningItemContent::ReasoningText {
+                text: "internal".to_string(),
+            }]),
+            encrypted_content: None,
+        };
+
+        assert_eq!(
+            estimate_chat_output_tokens_for_item(&assistant),
+            approx_chars_to_tokens(count_chars("hello"))
+        );
+        assert_eq!(
+            estimate_chat_output_tokens_for_item(&tool_call),
+            approx_chars_to_tokens(
+                count_chars("read_file") + count_chars("{\"path\":\"src/lib.rs\"}")
+            )
+        );
+        assert_eq!(estimate_chat_output_tokens_for_item(&reasoning), 0);
+    }
+
+    #[test]
+    fn approx_chars_to_tokens_uses_char_count() {
+        assert_eq!(approx_chars_to_tokens(count_chars("abcdefg")), 2);
+        assert_eq!(approx_chars_to_tokens(count_chars("你好世界a")), 2);
     }
 }

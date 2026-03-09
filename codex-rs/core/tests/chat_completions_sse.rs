@@ -20,6 +20,7 @@ use codex_protocol::protocol::SessionSource;
 use core_test_support::load_default_config_for_test;
 use core_test_support::skip_if_no_network;
 use futures::StreamExt;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -193,6 +194,36 @@ async fn streams_text_without_reasoning() {
     }
 
     assert_matches!(events[3], ResponseEvent::Completed { .. });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_text_with_estimated_token_usage() {
+    skip_if_no_network!();
+
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let events = run_stream(sse).await;
+    let completed = events
+        .last()
+        .unwrap_or_else(|| panic!("expected completed event, got {events:?}"));
+
+    match completed {
+        ResponseEvent::Completed {
+            token_usage: Some(token_usage),
+            ..
+        } => {
+            assert_eq!(token_usage.input_tokens, 2);
+            assert_eq!(token_usage.cached_input_tokens, 0);
+            assert_eq!(token_usage.output_tokens, 1);
+            assert_eq!(token_usage.reasoning_output_tokens, 0);
+            assert_eq!(token_usage.total_tokens, 3);
+        }
+        other => panic!("expected completed event with usage, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -392,6 +423,35 @@ async fn streams_reasoning_before_tool_call() {
     }
 
     assert_matches!(events[4], ResponseEvent::Completed { .. });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_tool_call_with_estimated_token_usage() {
+    skip_if_no_network!();
+
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let events = run_stream(sse).await;
+    let completed = events
+        .last()
+        .unwrap_or_else(|| panic!("expected completed event, got {events:?}"));
+
+    match completed {
+        ResponseEvent::Completed {
+            token_usage: Some(token_usage),
+            ..
+        } => {
+            assert_eq!(token_usage.input_tokens, 2);
+            assert_eq!(token_usage.cached_input_tokens, 0);
+            assert_eq!(token_usage.output_tokens, 2);
+            assert_eq!(token_usage.reasoning_output_tokens, 0);
+            assert_eq!(token_usage.total_tokens, 4);
+        }
+        other => panic!("expected completed event with usage, got {other:?}"),
+    }
 }
 
 #[tokio::test]
