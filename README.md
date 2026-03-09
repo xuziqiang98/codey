@@ -5,7 +5,10 @@
 
 ## Quickstart
 
-### Installing and running Codex CLI
+### Building
+```
+cd codex-rs && cargo build -p codex-cli --bin codey
+```
 
 ## Docs
 

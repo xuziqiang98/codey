@@ -5334,7 +5334,7 @@ impl ChatWidget {
         }
         match self.active_mode_kind() {
             ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
-            ModeKind::Code => None,
+            ModeKind::Code => Some(CollaborationModeIndicator::Code),
             ModeKind::PairProgramming => Some(CollaborationModeIndicator::PairProgramming),
             ModeKind::Execute => Some(CollaborationModeIndicator::Execute),
             ModeKind::Custom => None,

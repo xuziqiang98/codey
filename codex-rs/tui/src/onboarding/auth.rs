@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
+use textwrap::wrap;
 use toml_edit::value;
 
 use crate::LoginStatus;
@@ -317,6 +318,44 @@ pub(crate) struct AuthModeWidget {
 }
 
 impl AuthModeWidget {
+    fn wrapped_line_count(text: &str, width: u16) -> u16 {
+        let usable_width = usize::from(width.max(1));
+        wrap(text, usable_width)
+            .len()
+            .try_into()
+            .unwrap_or(u16::MAX)
+    }
+
+    fn api_key_entry_input_height(&self, width: u16, state: &ApiKeyInputState) -> u16 {
+        let inner_width = width.saturating_sub(2).max(1);
+        match state.step {
+            ApiProviderWizardStep::WireApi => {
+                let options = [ApiProviderWireApi::Chat, ApiProviderWireApi::Responses];
+                let content_height =
+                    options
+                        .into_iter()
+                        .enumerate()
+                        .fold(0u16, |total, (idx, option)| {
+                            let label = format!("  {}. {}", idx + 1, option.label());
+                            let description = format!("     {}", option.description());
+                            total
+                                .saturating_add(Self::wrapped_line_count(&label, inner_width))
+                                .saturating_add(Self::wrapped_line_count(&description, inner_width))
+                        });
+                content_height.saturating_add(2)
+            }
+            _ => {
+                let value = self.current_step_value_for_display(state);
+                let content = if value.is_empty() {
+                    state.step.placeholder().to_string()
+                } else {
+                    value
+                };
+                Self::wrapped_line_count(&content, inner_width).saturating_add(2)
+            }
+        }
+    }
+
     fn is_api_login_allowed(&self) -> bool {
         !matches!(self.forced_login_method, Some(ForcedLoginMethod::Chatgpt))
     }
@@ -572,13 +611,11 @@ impl AuthModeWidget {
     }
 
     fn render_api_key_entry(&self, area: Rect, buf: &mut Buffer, state: &ApiKeyInputState) {
-        let input_height = if state.step == ApiProviderWizardStep::WireApi {
-            5
-        } else {
-            3
-        };
-        let [intro_area, input_area, footer_area] = Layout::vertical([
-            Constraint::Min(10),
+        let input_height = self.api_key_entry_input_height(area.width, state);
+        let intro_min_height = if state.validating { 12 } else { 10 };
+        let [intro_area, _spacer_area, input_area, footer_area] = Layout::vertical([
+            Constraint::Min(intro_min_height),
+            Constraint::Length(1),
             Constraint::Length(input_height),
             Constraint::Min(4),
         ])
@@ -608,15 +645,14 @@ impl AuthModeWidget {
                 display_optional_value(&state.model, "<not set>")
             )
             .into(),
-            "".into(),
         ];
         if state.validating {
+            intro_lines.push("".into());
             intro_lines.push(
                 "  Validating provider settings and saving config.toml..."
                     .cyan()
                     .into(),
             );
-            intro_lines.push("".into());
         }
         Paragraph::new(intro_lines)
             .wrap(Wrap { trim: false })
@@ -1282,6 +1318,8 @@ fn display_optional_value<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
     use tempfile::TempDir;
 
     use codex_core::auth::AuthCredentialsStoreMode;
@@ -1308,6 +1346,39 @@ mod tests {
             animations_enabled: true,
         };
         (widget, codex_home)
+    }
+
+    fn widget_custom_provider_entry() -> (AuthModeWidget, TempDir) {
+        let codex_home = TempDir::new().unwrap();
+        let codex_home_path = codex_home.path().to_path_buf();
+        let widget = AuthModeWidget {
+            request_frame: FrameRequester::test_dummy(),
+            highlighted_mode: SignInOption::ApiKey,
+            error: None,
+            sign_in_state: Arc::new(RwLock::new(SignInState::ApiKeyEntry(
+                ApiKeyInputState::default(),
+            ))),
+            codex_home: codex_home_path.clone(),
+            cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+            login_status: LoginStatus::NotAuthenticated,
+            auth_manager: AuthManager::shared(
+                codex_home_path,
+                false,
+                AuthCredentialsStoreMode::File,
+            ),
+            forced_chatgpt_workspace_id: None,
+            forced_login_method: None,
+            animations_enabled: true,
+        };
+        (widget, codex_home)
+    }
+
+    fn row_text(buf: &Buffer, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     #[test]
@@ -1377,6 +1448,44 @@ mod tests {
                 model: "model-x".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn custom_provider_entry_keeps_blank_line_before_input_box() {
+        let (widget, _tmp) = widget_custom_provider_entry();
+        let area = Rect::new(0, 0, 160, 20);
+        let mut buf = Buffer::empty(area);
+
+        (&widget).render_ref(area, &mut buf);
+
+        let lines = (0..area.height)
+            .map(|row| row_text(&buf, row, area.width))
+            .collect::<Vec<String>>();
+
+        let model_row = lines
+            .iter()
+            .position(|line| line.contains("  Model: <not set>"))
+            .expect("model summary row");
+        let border_row = lines
+            .iter()
+            .position(|line| line.starts_with("╭Provider ID"))
+            .expect("input border row");
+
+        assert_eq!(border_row, model_row + 2);
+        assert_eq!(lines[model_row + 1], "");
+    }
+
+    #[test]
+    fn wire_api_entry_uses_dynamic_input_height() {
+        let (widget, _tmp) = widget_custom_provider_entry();
+        let state = ApiKeyInputState {
+            step: ApiProviderWizardStep::WireApi,
+            ..ApiKeyInputState::default()
+        };
+
+        let input_height = widget.api_key_entry_input_height(120, &state);
+
+        assert_eq!(input_height, 6);
     }
 
     #[test]

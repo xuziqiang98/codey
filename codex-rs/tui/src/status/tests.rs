@@ -480,6 +480,90 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
 }
 
 #[tokio::test]
+async fn status_snapshot_hides_usage_note_for_configured_custom_model() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("mock-model".to_string());
+    config.model_provider_id = "mock-provider".to_string();
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        now,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .all(|line| !line.contains("https://chatgpt.com/codex/settings/usage")),
+        "expected no usage note for configured custom model, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_hides_usage_note_for_custom_provider_with_official_model_name() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.2-codex".to_string());
+    config.model_provider_id = "mock-provider".to_string();
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        now,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .all(|line| !line.contains("https://chatgpt.com/codex/settings/usage")),
+        "expected no usage note for custom provider, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn status_card_token_usage_excludes_cached_tokens() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;

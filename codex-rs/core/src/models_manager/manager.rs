@@ -386,6 +386,42 @@ impl ModelsManager {
         })
     }
 
+    pub fn is_configured_custom_model(
+        model: &str,
+        config: &Config,
+        auth_mode: Option<AuthMode>,
+    ) -> bool {
+        let model = model.trim();
+        let Some(config_model) = config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|configured_model| !configured_model.is_empty())
+        else {
+            return false;
+        };
+
+        if config_model != model {
+            return false;
+        }
+
+        let local_presets = builtin_model_presets(auth_mode);
+        let remote_presets: Vec<ModelPreset> = Self::load_remote_models_from_file()
+            .map(|response_models| response_models.into_iter().map(Into::into).collect())
+            .unwrap_or_default();
+        let picker_models = ModelPreset::filter_by_auth(
+            ModelPreset::merge(remote_presets, local_presets),
+            matches!(auth_mode, Some(AuthMode::Chatgpt)),
+        )
+        .into_iter()
+        .filter(|preset| preset.show_in_picker)
+        .collect::<Vec<_>>();
+
+        !picker_models
+            .iter()
+            .any(|preset| preset.model == config_model)
+    }
+
     async fn get_remote_models(&self, config: &Config) -> Vec<ModelInfo> {
         if config.features.enabled(Feature::RemoteModels) {
             self.remote_models.read().await.clone()
@@ -896,5 +932,34 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == "gpt-5.2-codex" && preset.is_default)
         );
+    }
+
+    #[tokio::test]
+    async fn configured_custom_model_detection_matches_picker_behavior() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+
+        config.model = Some("mock-model".to_string());
+        assert!(ModelsManager::is_configured_custom_model(
+            "mock-model",
+            &config,
+            auth_manager.get_internal_auth_mode(),
+        ));
+
+        config.model = Some("gpt-5.2-codex".to_string());
+        assert!(!ModelsManager::is_configured_custom_model(
+            "gpt-5.2-codex",
+            &config,
+            auth_manager.get_internal_auth_mode(),
+        ));
     }
 }

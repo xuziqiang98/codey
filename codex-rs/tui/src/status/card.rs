@@ -8,6 +8,7 @@ use chrono::Local;
 use codex_common::summarize_sandbox_policy;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_core::protocol::NetworkAccess;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::TokenUsage;
@@ -67,6 +68,7 @@ struct StatusHistoryCell {
     agents_summary: String,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
+    show_usage_note: bool,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
     session_id: Option<String>,
@@ -169,6 +171,12 @@ impl StatusHistoryCell {
         };
         let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
+        let show_usage_note = config.model_provider_id == "openai"
+            && !ModelsManager::is_configured_custom_model(
+                &model_name,
+                config,
+                auth_manager.get_internal_auth_mode(),
+            );
         let account = compose_account_display(auth_manager, plan_type);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
@@ -200,6 +208,7 @@ impl StatusHistoryCell {
             agents_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
             model_provider,
+            show_usage_note,
             account,
             thread_name,
             session_id,
@@ -412,22 +421,24 @@ impl HistoryCell for StatusHistoryCell {
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
 
-        let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            "https://chatgpt.com/codex/settings/usage"
-                .cyan()
-                .underlined(),
-            Span::from(" for up-to-date").cyan(),
-        ]);
-        let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
-        ]);
-        let note_lines = word_wrap_lines(
-            [note_first_line, note_second_line],
-            RtOptions::new(available_inner_width),
-        );
-        lines.extend(note_lines);
-        lines.push(Line::from(Vec::<Span<'static>>::new()));
+        if self.show_usage_note {
+            let note_first_line = Line::from(vec![
+                Span::from("Visit ").cyan(),
+                "https://chatgpt.com/codex/settings/usage"
+                    .cyan()
+                    .underlined(),
+                Span::from(" for up-to-date").cyan(),
+            ]);
+            let note_second_line = Line::from(vec![
+                Span::from("information on rate limits and credits").cyan(),
+            ]);
+            let note_lines = word_wrap_lines(
+                [note_first_line, note_second_line],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(note_lines);
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
 
         let mut model_spans = vec![Span::from(self.model_name.clone())];
         if !self.model_details.is_empty() {
