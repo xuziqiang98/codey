@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::api_bridge::CoreAuthProvider;
@@ -62,6 +63,7 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
+use crate::dynamic_context_window::DynamicContextWindowState;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::features::FEATURES;
@@ -82,6 +84,7 @@ struct ModelClientState {
     config: Arc<Config>,
     auth_manager: Option<Arc<AuthManager>>,
     model_info: ModelInfo,
+    dynamic_context_window: Option<Arc<Mutex<DynamicContextWindowState>>>,
     otel_manager: OtelManager,
     provider: ModelProviderInfo,
     conversation_id: ThreadId,
@@ -128,11 +131,40 @@ impl ModelClient {
         session_source: SessionSource,
         transport_manager: TransportManager,
     ) -> Self {
+        Self::new_with_dynamic_context_window(
+            config,
+            auth_manager,
+            model_info,
+            None,
+            otel_manager,
+            provider,
+            effort,
+            summary,
+            conversation_id,
+            session_source,
+            transport_manager,
+        )
+    }
+
+    pub(crate) fn new_with_dynamic_context_window(
+        config: Arc<Config>,
+        auth_manager: Option<Arc<AuthManager>>,
+        model_info: ModelInfo,
+        dynamic_context_window: Option<Arc<Mutex<DynamicContextWindowState>>>,
+        otel_manager: OtelManager,
+        provider: ModelProviderInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        conversation_id: ThreadId,
+        session_source: SessionSource,
+        transport_manager: TransportManager,
+    ) -> Self {
         Self {
             state: Arc::new(ModelClientState {
                 config,
                 auth_manager,
                 model_info,
+                dynamic_context_window,
                 otel_manager,
                 provider,
                 conversation_id,
@@ -156,8 +188,21 @@ impl ModelClient {
 }
 
 impl ModelClient {
+    fn effective_model_info(&self) -> ModelInfo {
+        let mut model_info = self.state.model_info.clone();
+        if let Some(dynamic_context_window) = &self.state.dynamic_context_window
+            && model_info.context_window.is_none()
+        {
+            let dynamic_context_window = dynamic_context_window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            model_info.context_window = Some(dynamic_context_window.current_context_window());
+        }
+        model_info
+    }
+
     pub fn get_model_context_window(&self) -> Option<i64> {
-        let model_info = &self.state.model_info;
+        let model_info = self.effective_model_info();
         let effective_context_window_percent = model_info.effective_context_window_percent;
         model_info.context_window.map(|context_window| {
             context_window.saturating_mul(effective_context_window_percent) / 100
@@ -194,7 +239,7 @@ impl ModelClient {
     }
 
     pub fn get_model_info(&self) -> ModelInfo {
-        self.state.model_info.clone()
+        self.effective_model_info()
     }
 
     /// Returns the current reasoning effort setting.
@@ -209,6 +254,62 @@ impl ModelClient {
 
     pub fn get_auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.state.auth_manager.clone()
+    }
+
+    pub(crate) fn maybe_upgrade_dynamic_context_window(&self, input_tokens: i64) -> Option<i64> {
+        self.state
+            .dynamic_context_window
+            .as_ref()
+            .and_then(|window| {
+                window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .maybe_upgrade(input_tokens)
+            })
+    }
+
+    pub(crate) fn record_dynamic_context_window_retry(
+        &self,
+        turn_id: &str,
+        input_tokens: i64,
+    ) -> bool {
+        self.state
+            .dynamic_context_window
+            .as_ref()
+            .is_some_and(|window| {
+                window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_compact_retry(turn_id, input_tokens)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_context_window(&self) -> Option<Arc<Mutex<DynamicContextWindowState>>> {
+        self.state.dynamic_context_window.clone()
+    }
+
+    pub(crate) fn estimated_input_tokens_for_prompt(&self, prompt: &Prompt) -> Option<i64> {
+        if self.state.provider.wire_api != WireApi::Chat {
+            return None;
+        }
+
+        let instructions = prompt.base_instructions.text.clone();
+        let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools).ok()?;
+        let api_prompt = build_api_prompt(prompt, instructions, tools_json);
+        let api_provider = self.state.provider.to_api_provider(None).ok()?;
+        let request = ApiChatRequestBuilder::new(
+            &self.state.model_info.slug,
+            &api_prompt.instructions,
+            &api_prompt.input,
+            &api_prompt.tools,
+        )
+        .conversation_id(Some(self.state.conversation_id.to_string()))
+        .session_source(Some(self.state.session_source.clone()))
+        .build(&api_provider)
+        .ok()?;
+
+        Some(estimate_chat_input_tokens_from_request_body(&request.body))
     }
 
     /// Compacts the current conversation history using the Compact endpoint.

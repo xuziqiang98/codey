@@ -41,7 +41,13 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 // --- Test helpers -----------------------------------------------------------
 
 pub(super) const FIRST_REPLY: &str = "FIRST_REPLY";
@@ -109,6 +115,50 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     provider.name = "OpenAI (test)".into();
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider
+}
+
+fn unknown_chat_model_provider(server: &MockServer) -> ModelProviderInfo {
+    let mut provider = non_openai_model_provider(server);
+    provider.wire_api = codex_core::WireApi::Chat;
+    provider.supports_websockets = false;
+    provider
+}
+
+fn chat_sse_delta_and_stop(text: &str) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&json!({
+            "choices": [{"delta": {"content": text}, "finish_reason": "stop"}]
+        }))
+        .expect("serialize chat stop response")
+    )
+}
+
+fn chat_sse_length() -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&json!({
+            "choices": [{"delta": {}, "finish_reason": "length"}]
+        }))
+        .expect("serialize chat length response")
+    )
+}
+
+struct ChatSeqResponder {
+    num_calls: AtomicUsize,
+    bodies: Vec<String>,
+}
+
+impl wiremock::Respond for ChatSeqResponder {
+    fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let idx = self.num_calls.fetch_add(1, Ordering::SeqCst);
+        match self.bodies.get(idx) {
+            Some(body) => ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body.clone()),
+            None => panic!("no chat completion response for index {idx}"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2434,5 +2484,155 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         compact_requests.len(),
         1,
         "remote compaction should run once after the reasoning header clears"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_chat_model_upgrades_context_window_after_large_success() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let chat_seq = ChatSeqResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies: vec![
+            chat_sse_delta_and_stop("first reply"),
+            chat_sse_delta_and_stop("second reply"),
+        ],
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(chat_seq)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let model_provider = unknown_chat_model_provider(&server);
+    let large_input = "a".repeat(140_000);
+
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model = Some("unknown-chat-model".to_string());
+            config.model_provider = model_provider;
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: large_input,
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit large turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "follow up".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit follow-up turn");
+
+    let model_context_window = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::TurnStarted(event) => Some(event.model_context_window),
+        _ => None,
+    })
+    .await;
+    assert_eq!(model_context_window, Some(121_600));
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_chat_model_context_limit_compacts_and_retries() {
+    skip_if_no_network!();
+
+    enum TerminalEvent {
+        TurnComplete,
+        Error(String),
+    }
+
+    let server = MockServer::start().await;
+    let chat_seq = ChatSeqResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies: vec![
+            chat_sse_length(),
+            chat_sse_delta_and_stop(AUTO_SUMMARY_TEXT),
+            chat_sse_delta_and_stop(FINAL_REPLY),
+        ],
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(chat_seq)
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let model_provider = unknown_chat_model_provider(&server);
+    let large_input = "b".repeat(140_000);
+
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model = Some("unknown-chat-model".to_string());
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: large_input.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit large turn");
+
+    let terminal = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::TurnComplete(_) => Some(TerminalEvent::TurnComplete),
+        EventMsg::Error(err) => Some(TerminalEvent::Error(err.message.clone())),
+        _ => None,
+    })
+    .await;
+    match terminal {
+        TerminalEvent::TurnComplete => {}
+        TerminalEvent::Error(message) => panic!("unexpected error event: {message}"),
+    }
+
+    let requests = server.received_requests().await.expect("capture requests");
+    let chat_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chat_requests.len(),
+        3,
+        "expected initial, compact, and retry requests"
+    );
+
+    let compact_body = String::from_utf8_lossy(&chat_requests[1].body);
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "compact request should include the summarization prompt"
+    );
+
+    let retry_body = String::from_utf8_lossy(&chat_requests[2].body);
+    assert!(
+        body_contains_text(&retry_body, AUTO_SUMMARY_TEXT),
+        "retry request should include the compacted summary"
     );
 }

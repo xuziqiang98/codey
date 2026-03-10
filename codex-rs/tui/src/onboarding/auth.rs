@@ -1456,7 +1456,7 @@ mod tests {
         let area = Rect::new(0, 0, 160, 20);
         let mut buf = Buffer::empty(area);
 
-        (&widget).render_ref(area, &mut buf);
+        (widget).render_ref(area, &mut buf);
 
         let lines = (0..area.height)
             .map(|row| row_text(&buf, row, area.width))

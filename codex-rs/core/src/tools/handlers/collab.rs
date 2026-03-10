@@ -771,10 +771,11 @@ mod tests {
             parent_thread_id: session.conversation_id,
             depth: MAX_THREAD_SPAWN_DEPTH,
         });
-        turn.client = ModelClient::new(
+        turn.client = ModelClient::new_with_dynamic_context_window(
             turn.client.config(),
             Some(session.services.auth_manager.clone()),
             turn.client.get_model_info(),
+            turn.client.dynamic_context_window(),
             turn.client.get_otel_manager(),
             turn.client.get_provider(),
             turn.client.get_reasoning_effort(),
@@ -1223,10 +1224,11 @@ mod tests {
         base_config.user_instructions = Some("base-user".to_string());
         turn.user_instructions = Some("resolved-user".to_string());
         let transport_manager = turn.client.transport_manager();
-        turn.client = ModelClient::new(
+        turn.client = ModelClient::new_with_dynamic_context_window(
             Arc::new(base_config.clone()),
             Some(session.services.auth_manager.clone()),
             turn.client.get_model_info(),
+            turn.client.dynamic_context_window(),
             turn.client.get_otel_manager(),
             turn.client.get_provider(),
             turn.client.get_reasoning_effort(),
