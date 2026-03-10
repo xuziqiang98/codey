@@ -369,118 +369,6 @@ impl WidgetRef for &OnboardingScreen {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::onboarding::auth::ApiKeyInputState;
-    use crate::onboarding::auth::AuthModeWidget;
-    use crate::onboarding::auth::SignInOption;
-    use crate::onboarding::auth::SignInState;
-    use codex_core::auth::AuthCredentialsStoreMode;
-    use pretty_assertions::assert_eq;
-    use ratatui::layout::Rect;
-    use std::sync::Arc;
-    use std::sync::RwLock;
-    use tempfile::TempDir;
-
-    fn custom_provider_auth_widget() -> (AuthModeWidget, TempDir) {
-        let codex_home = TempDir::new().expect("tempdir");
-        let codex_home_path = codex_home.path().to_path_buf();
-        let widget = AuthModeWidget {
-            request_frame: FrameRequester::test_dummy(),
-            highlighted_mode: SignInOption::ApiKey,
-            error: None,
-            sign_in_state: Arc::new(RwLock::new(SignInState::ApiKeyEntry(
-                ApiKeyInputState::default(),
-            ))),
-            codex_home: codex_home_path.clone(),
-            cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-            login_status: LoginStatus::NotAuthenticated,
-            auth_manager: AuthManager::shared(
-                codex_home_path,
-                false,
-                AuthCredentialsStoreMode::File,
-            ),
-            forced_chatgpt_workspace_id: None,
-            forced_login_method: None,
-            animations_enabled: true,
-        };
-        (widget, codex_home)
-    }
-
-    fn row_text(buf: &Buffer, row: u16, width: u16) -> String {
-        (0..width)
-            .map(|col| buf[(col, row)].symbol())
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    }
-
-    #[test]
-    fn small_window_hides_welcome_ascii_to_preserve_api_key_input() {
-        let (auth_widget, _tmp) = custom_provider_auth_widget();
-        let screen = OnboardingScreen {
-            request_frame: FrameRequester::test_dummy(),
-            steps: vec![
-                Step::Welcome(WelcomeWidget::new(
-                    false,
-                    FrameRequester::test_dummy(),
-                    true,
-                )),
-                Step::Auth(auth_widget),
-            ],
-            is_done: false,
-            should_exit: false,
-        };
-
-        let area = Rect::new(0, 0, 80, 20);
-        let mut buf = Buffer::empty(area);
-        (&screen).render_ref(area, &mut buf);
-
-        let lines = (0..area.height)
-            .map(|row| row_text(&buf, row, area.width))
-            .collect::<Vec<String>>();
-
-        assert_eq!(lines.iter().any(|line| line.contains("#######")), false);
-        assert_eq!(
-            lines.iter().any(|line| line.starts_with("╭Provider ID")),
-            true
-        );
-    }
-
-    #[test]
-    fn tall_window_keeps_welcome_ascii_above_api_key_input() {
-        let (auth_widget, _tmp) = custom_provider_auth_widget();
-        let screen = OnboardingScreen {
-            request_frame: FrameRequester::test_dummy(),
-            steps: vec![
-                Step::Welcome(WelcomeWidget::new(
-                    false,
-                    FrameRequester::test_dummy(),
-                    true,
-                )),
-                Step::Auth(auth_widget),
-            ],
-            is_done: false,
-            should_exit: false,
-        };
-
-        let area = Rect::new(0, 0, 80, 28);
-        let mut buf = Buffer::empty(area);
-        (&screen).render_ref(area, &mut buf);
-
-        let lines = (0..area.height)
-            .map(|row| row_text(&buf, row, area.width))
-            .collect::<Vec<String>>();
-
-        assert_eq!(lines.iter().any(|line| line.contains("#######")), true);
-        assert_eq!(
-            lines.iter().any(|line| line.starts_with("╭Provider ID")),
-            true
-        );
-    }
-}
-
 impl KeyboardHandler for Step {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match self {
@@ -594,4 +482,116 @@ pub(crate) async fn run_onboarding_app(
         config_updated: onboarding_screen.config_updated(),
         should_exit: onboarding_screen.should_exit(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboarding::auth::ApiKeyInputState;
+    use crate::onboarding::auth::AuthModeWidget;
+    use crate::onboarding::auth::SignInOption;
+    use crate::onboarding::auth::SignInState;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use pretty_assertions::assert_eq;
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use std::sync::RwLock;
+    use tempfile::TempDir;
+
+    fn custom_provider_auth_widget() -> (AuthModeWidget, TempDir) {
+        let codex_home = TempDir::new().expect("tempdir");
+        let codex_home_path = codex_home.path().to_path_buf();
+        let widget = AuthModeWidget {
+            request_frame: FrameRequester::test_dummy(),
+            highlighted_mode: SignInOption::ApiKey,
+            error: None,
+            sign_in_state: Arc::new(RwLock::new(SignInState::ApiKeyEntry(
+                ApiKeyInputState::default(),
+            ))),
+            codex_home: codex_home_path.clone(),
+            cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+            login_status: LoginStatus::NotAuthenticated,
+            auth_manager: AuthManager::shared(
+                codex_home_path,
+                false,
+                AuthCredentialsStoreMode::File,
+            ),
+            forced_chatgpt_workspace_id: None,
+            forced_login_method: None,
+            animations_enabled: true,
+        };
+        (widget, codex_home)
+    }
+
+    fn row_text(buf: &Buffer, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn small_window_hides_welcome_ascii_to_preserve_api_key_input() {
+        let (auth_widget, _tmp) = custom_provider_auth_widget();
+        let screen = OnboardingScreen {
+            request_frame: FrameRequester::test_dummy(),
+            steps: vec![
+                Step::Welcome(WelcomeWidget::new(
+                    false,
+                    FrameRequester::test_dummy(),
+                    true,
+                )),
+                Step::Auth(auth_widget),
+            ],
+            is_done: false,
+            should_exit: false,
+        };
+
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        (&screen).render_ref(area, &mut buf);
+
+        let lines = (0..area.height)
+            .map(|row| row_text(&buf, row, area.width))
+            .collect::<Vec<String>>();
+
+        assert_eq!(lines.iter().any(|line| line.contains("#######")), false);
+        assert_eq!(
+            lines.iter().any(|line| line.starts_with("╭Provider ID")),
+            true
+        );
+    }
+
+    #[test]
+    fn tall_window_keeps_welcome_ascii_above_api_key_input() {
+        let (auth_widget, _tmp) = custom_provider_auth_widget();
+        let screen = OnboardingScreen {
+            request_frame: FrameRequester::test_dummy(),
+            steps: vec![
+                Step::Welcome(WelcomeWidget::new(
+                    false,
+                    FrameRequester::test_dummy(),
+                    true,
+                )),
+                Step::Auth(auth_widget),
+            ],
+            is_done: false,
+            should_exit: false,
+        };
+
+        let area = Rect::new(0, 0, 80, 28);
+        let mut buf = Buffer::empty(area);
+        (&screen).render_ref(area, &mut buf);
+
+        let lines = (0..area.height)
+            .map(|row| row_text(&buf, row, area.width))
+            .collect::<Vec<String>>();
+
+        assert_eq!(lines.iter().any(|line| line.contains("#######")), true);
+        assert_eq!(
+            lines.iter().any(|line| line.starts_with("╭Provider ID")),
+            true
+        );
+    }
 }

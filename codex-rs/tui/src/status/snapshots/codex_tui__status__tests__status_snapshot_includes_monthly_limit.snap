@@ -1,5 +1,6 @@
 ---
 source: tui/src/status/tests.rs
+assertion_line: 354
 expression: sanitized
 ---
 /status
@@ -15,8 +16,8 @@ expression: sanitized
 │  Approval:         on-request                                              │
 │  Sandbox:          read-only                                               │
 │  Agents.md:        <none>                                                  │
+│  Account:          user@example.com (Unknown)                              │
 │                                                                            │
-│  Token usage:      1.2K total  (800 input + 400 output)                    │
 │  Context window:   100% left (1.2K used / 272K)                            │
 │  Monthly limit:    [██████████████████░░] 88% left (resets 07:08 on 7 May) │
 ╰────────────────────────────────────────────────────────────────────────────╯

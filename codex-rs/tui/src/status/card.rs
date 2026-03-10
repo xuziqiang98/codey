@@ -68,6 +68,7 @@ struct StatusHistoryCell {
     agents_summary: String,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
+    show_limits: bool,
     show_usage_note: bool,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
@@ -171,13 +172,15 @@ impl StatusHistoryCell {
         };
         let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
-        let show_usage_note = config.model_provider_id == "openai"
+        let account = compose_account_display(auth_manager, plan_type);
+        let show_limits = matches!(account, Some(StatusAccountDisplay::ChatGpt { .. }))
+            && config.model_provider.is_openai()
             && !ModelsManager::is_configured_custom_model(
                 &model_name,
                 config,
                 auth_manager.get_internal_auth_mode(),
             );
-        let account = compose_account_display(auth_manager, plan_type);
+        let show_usage_note = show_limits;
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -208,6 +211,7 @@ impl StatusHistoryCell {
             agents_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
             model_provider,
+            show_limits,
             show_usage_note,
             account,
             thread_name,
@@ -416,7 +420,9 @@ impl HistoryCell for StatusHistoryCell {
             push_label(&mut labels, &mut seen, "Context window");
         }
 
-        self.collect_rate_limit_labels(&mut seen, &mut labels);
+        if self.show_limits {
+            self.collect_rate_limit_labels(&mut seen, &mut labels);
+        }
 
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
@@ -487,7 +493,9 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(formatter.line("Context window", spans));
         }
 
-        lines.extend(self.rate_limit_lines(available_inner_width, &formatter));
+        if self.show_limits {
+            lines.extend(self.rate_limit_lines(available_inner_width, &formatter));
+        }
 
         let content_width = lines.iter().map(line_display_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);
