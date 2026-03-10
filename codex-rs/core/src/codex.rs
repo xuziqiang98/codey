@@ -3378,6 +3378,8 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
     let mut client_session = turn_context.client.new_session();
+    let mut has_sent_sampling_request = false;
+    let mut preflight_compaction_attempted = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -3408,6 +3410,7 @@ pub(crate) async fn run_turn(
         let tool_selection = SamplingRequestToolSelection {
             explicit_app_paths: &explicit_app_paths,
             skill_name_counts_lower: &skill_name_counts_lower,
+            allow_preflight_compact: !has_sent_sampling_request && !preflight_compaction_attempted,
         };
         match run_sampling_request(
             Arc::clone(&sess),
@@ -3421,17 +3424,26 @@ pub(crate) async fn run_turn(
         .await
         {
             Ok(sampling_request_output) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                     request_input_tokens,
+                    tool_output_tokens,
                 } = sampling_request_output;
                 if let Some(input_tokens) = request_input_tokens {
                     let _ = turn_context
                         .client
                         .maybe_upgrade_dynamic_context_window(input_tokens);
                 }
-                let total_usage_tokens = sess.get_total_token_usage().await;
+                let total_usage_tokens = if needs_follow_up {
+                    sess.get_total_token_usage()
+                        .await
+                        .saturating_add(tool_output_tokens)
+                } else {
+                    sess.get_total_token_usage().await
+                };
                 let token_limit_reached =
                     total_usage_tokens >= auto_compact_limit(turn_context.as_ref());
 
@@ -3458,6 +3470,8 @@ pub(crate) async fn run_turn(
             Err(SamplingRequestError::ContextWindowExceeded {
                 request_input_tokens,
             }) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
                 let should_retry = request_input_tokens.is_some_and(|input_tokens| {
                     turn_context
                         .client
@@ -3475,11 +3489,18 @@ pub(crate) async fn run_turn(
                 sess.send_event(&turn_context, event).await;
                 break;
             }
+            Err(SamplingRequestError::PreflightCompactRequired) => {
+                preflight_compaction_attempted = true;
+                run_auto_compact(&sess, &turn_context).await;
+                continue;
+            }
             Err(SamplingRequestError::Codex(CodexErr::TurnAborted)) => {
                 // Aborted turn is reported via a different event.
                 break;
             }
             Err(SamplingRequestError::Codex(CodexErr::InvalidImageRequest())) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
                 let mut state = sess.state.lock().await;
                 error_or_panic(
                     "Invalid image detected; sanitizing tool output to prevent poisoning",
@@ -3514,6 +3535,15 @@ fn auto_compact_limit(turn_context: &TurnContext) -> i64 {
         .get_model_info()
         .auto_compact_token_limit()
         .unwrap_or(i64::MAX)
+}
+
+fn should_preflight_compact(turn_context: &TurnContext, request_input_tokens: Option<i64>) -> bool {
+    request_input_tokens.is_some_and(|input_tokens| {
+        turn_context
+            .client
+            .get_model_context_window()
+            .is_some_and(|context_window| input_tokens >= context_window)
+    })
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
@@ -3620,6 +3650,7 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
 struct SamplingRequestToolSelection<'a> {
     explicit_app_paths: &'a [String],
     skill_name_counts_lower: &'a HashMap<String, usize>,
+    allow_preflight_compact: bool,
 }
 
 #[instrument(level = "trace",
@@ -3689,9 +3720,21 @@ async fn run_sampling_request(
         personality: turn_context.personality,
         output_schema: turn_context.final_output_json_schema.clone(),
     };
+    let history_input_tokens = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .map(|tokens| tokens.max(0));
     let request_input_tokens = turn_context
         .client
-        .estimated_input_tokens_for_prompt(&prompt);
+        .estimated_input_tokens_for_prompt(&prompt)
+        .or(history_input_tokens);
+
+    if tool_selection.allow_preflight_compact
+        && should_preflight_compact(turn_context.as_ref(), request_input_tokens)
+    {
+        return Err(SamplingRequestError::PreflightCompactRequired);
+    }
 
     let mut retries = 0;
     loop {
@@ -3774,6 +3817,7 @@ async fn run_sampling_request(
 #[derive(Debug)]
 enum SamplingRequestError {
     ContextWindowExceeded { request_input_tokens: Option<i64> },
+    PreflightCompactRequired,
     Codex(CodexErr),
 }
 
@@ -3782,6 +3826,7 @@ struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
     request_input_tokens: Option<i64>,
+    tool_output_tokens: i64,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -4163,7 +4208,12 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<i64> {
+    let estimated_before = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .unwrap_or(0);
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
@@ -4175,7 +4225,12 @@ async fn drain_in_flight(
             }
         }
     }
-    Ok(())
+    let estimated_after = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .unwrap_or(estimated_before);
+    Ok(estimated_after.saturating_sub(estimated_before))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4372,6 +4427,7 @@ async fn try_run_sampling_request(
                     needs_follow_up,
                     last_agent_message,
                     request_input_tokens: None,
+                    tool_output_tokens: 0,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -4452,7 +4508,8 @@ async fn try_run_sampling_request(
         }
     };
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let tool_output_tokens =
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
         let unified_diff = {
@@ -4465,7 +4522,10 @@ async fn try_run_sampling_request(
         }
     }
 
-    outcome
+    outcome.map(|mut output| {
+        output.tool_output_tokens = tool_output_tokens;
+        output
+    })
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
@@ -4822,6 +4882,44 @@ mod tests {
         expected.extend(session.build_initial_context(&turn_context).await);
         let history = session.state.lock().await.clone_history();
         assert_eq!(expected, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn preflight_compact_uses_dynamic_context_window() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        assert!(turn_context.client.dynamic_context_window().is_some());
+
+        let context_window = turn_context
+            .client
+            .get_model_context_window()
+            .expect("dynamic context window");
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(context_window)
+        ));
+        assert!(!should_preflight_compact(
+            &turn_context,
+            Some(context_window - 1)
+        ));
     }
 
     #[tokio::test]

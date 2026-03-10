@@ -6,9 +6,11 @@ use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::Stream;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,12 +75,13 @@ pub async fn process_chat_sse<S>(
     let mut last_tool_call_index: Option<usize> = None;
     let mut assistant_item: Option<ResponseItem> = None;
     let mut reasoning_item: Option<ResponseItem> = None;
-    let mut completed_sent = false;
+    let mut token_usage: Option<TokenUsage> = None;
 
     async fn flush_and_complete(
         tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
         reasoning_item: &mut Option<ResponseItem>,
         assistant_item: &mut Option<ResponseItem>,
+        token_usage: &Option<TokenUsage>,
     ) {
         if let Some(reasoning) = reasoning_item.take() {
             let _ = tx_event
@@ -95,7 +98,7 @@ pub async fn process_chat_sse<S>(
         let _ = tx_event
             .send(Ok(ResponseEvent::Completed {
                 response_id: String::new(),
-                token_usage: None,
+                token_usage: token_usage.clone(),
             }))
             .await;
     }
@@ -113,9 +116,13 @@ pub async fn process_chat_sse<S>(
                 return;
             }
             Ok(None) => {
-                if !completed_sent {
-                    flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
-                }
+                flush_and_complete(
+                    &tx_event,
+                    &mut reasoning_item,
+                    &mut assistant_item,
+                    &token_usage,
+                )
+                .await;
                 return;
             }
             Err(_) => {
@@ -135,9 +142,13 @@ pub async fn process_chat_sse<S>(
         }
 
         if data == "[DONE]" || data == "DONE" {
-            if !completed_sent {
-                flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
-            }
+            flush_and_complete(
+                &tx_event,
+                &mut reasoning_item,
+                &mut assistant_item,
+                &token_usage,
+            )
+            .await;
             return;
         }
 
@@ -151,6 +162,10 @@ pub async fn process_chat_sse<S>(
                 continue;
             }
         };
+
+        if let Some(parsed_usage) = parse_chat_token_usage(&value) {
+            token_usage = Some(parsed_usage);
+        }
 
         let Some(choices) = value.get("choices").and_then(|c| c.as_array()) else {
             continue;
@@ -269,15 +284,6 @@ pub async fn process_chat_sse<S>(
                         .send(Ok(ResponseEvent::OutputItemDone(assistant)))
                         .await;
                 }
-                if !completed_sent {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id: String::new(),
-                            token_usage: None,
-                        }))
-                        .await;
-                    completed_sent = true;
-                }
                 continue;
             }
 
@@ -318,6 +324,31 @@ pub async fn process_chat_sse<S>(
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+}
+
+impl From<ChatCompletionUsage> for TokenUsage {
+    fn from(value: ChatCompletionUsage) -> Self {
+        Self {
+            input_tokens: value.prompt_tokens,
+            cached_input_tokens: 0,
+            output_tokens: value.completion_tokens,
+            reasoning_output_tokens: 0,
+            total_tokens: value.total_tokens,
+        }
+    }
+}
+
+fn parse_chat_token_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    serde_json::from_value::<ChatCompletionUsage>(value.get("usage")?.clone())
+        .ok()
+        .map(Into::into)
 }
 
 async fn append_assistant_text(
@@ -387,6 +418,7 @@ mod tests {
     use assert_matches::assert_matches;
     use codex_protocol::models::ResponseItem;
     use futures::TryStreamExt;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::sync::mpsc;
     use tokio_util::io::ReaderStream;
@@ -712,5 +744,65 @@ mod tests {
             )
         }));
         assert_matches!(events.last(), Some(ResponseEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn waits_for_usage_chunk_after_stop_finish_reason() {
+        let delta_content = json!({
+            "choices": [{
+                "delta": {
+                    "content": "hi"
+                }
+            }]
+        });
+
+        let finish_stop = json!({
+            "choices": [{
+                "finish_reason": "stop"
+            }]
+        });
+
+        let usage_only = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 7,
+                "total_tokens": 12
+            }
+        });
+
+        let body = format!(
+            "{}event: message\ndata: [DONE]\n\n",
+            build_body(&[delta_content, finish_stop, usage_only])
+        );
+        let events = collect_events(&body).await;
+
+        assert_matches!(
+            &events[..3],
+            [
+                ResponseEvent::OutputItemAdded(ResponseItem::Message { .. }),
+                ResponseEvent::OutputTextDelta(delta),
+                ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+            ] if delta == "hi"
+        );
+
+        let completed = events.last().expect("completed event");
+        let ResponseEvent::Completed {
+            token_usage: Some(token_usage),
+            ..
+        } = completed
+        else {
+            panic!("expected completed event with token usage");
+        };
+        assert_eq!(
+            token_usage,
+            &TokenUsage {
+                input_tokens: 5,
+                cached_input_tokens: 0,
+                output_tokens: 7,
+                reasoning_output_tokens: 0,
+                total_tokens: 12,
+            }
+        );
     }
 }
