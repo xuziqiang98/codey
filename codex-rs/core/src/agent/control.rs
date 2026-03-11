@@ -186,6 +186,7 @@ mod tests {
             let (home, config) = test_config().await;
             let manager = ThreadManager::with_models_provider_and_home(
                 CodexAuth::from_api_key("dummy"),
+                config.model_provider_id.as_str(),
                 config.model_provider.clone(),
                 config.codex_home.clone(),
             );
@@ -416,6 +417,7 @@ mod tests {
         .await;
         let manager = ThreadManager::with_models_provider_and_home(
             CodexAuth::from_api_key("dummy"),
+            config.model_provider_id.as_str(),
             config.model_provider.clone(),
             config.codex_home.clone(),
         );
@@ -459,6 +461,7 @@ mod tests {
         .await;
         let manager = ThreadManager::with_models_provider_and_home(
             CodexAuth::from_api_key("dummy"),
+            config.model_provider_id.as_str(),
             config.model_provider.clone(),
             config.codex_home.clone(),
         );
@@ -493,6 +496,7 @@ mod tests {
         .await;
         let manager = ThreadManager::with_models_provider_and_home(
             CodexAuth::from_api_key("dummy"),
+            config.model_provider_id.as_str(),
             config.model_provider.clone(),
             config.codex_home.clone(),
         );

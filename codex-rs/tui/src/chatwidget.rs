@@ -3731,10 +3731,13 @@ impl ChatWidget {
     }
 
     fn lower_cost_preset(&self) -> Option<ModelPreset> {
-        let models = self.models_manager.try_list_models(&self.config).ok()?;
+        let models = self
+            .models_manager
+            .try_list_picker_models(&self.config)
+            .ok()?;
         models
             .iter()
-            .find(|preset| preset.show_in_picker && preset.model == NUDGE_MODEL_SLUG)
+            .find(|preset| preset.model == NUDGE_MODEL_SLUG)
             .cloned()
     }
 
@@ -3848,16 +3851,18 @@ impl ChatWidget {
             return;
         }
 
-        let presets: Vec<ModelPreset> = match self.models_manager.try_list_models(&self.config) {
-            Ok(models) => models,
-            Err(_) => {
-                self.add_info_message(
-                    "Models are being updated; please try /model again in a moment.".to_string(),
-                    None,
-                );
-                return;
-            }
-        };
+        let presets: Vec<ModelPreset> =
+            match self.models_manager.try_list_picker_models(&self.config) {
+                Ok(models) => models,
+                Err(_) => {
+                    self.add_info_message(
+                        "Models are being updated; please try /model again in a moment."
+                            .to_string(),
+                        None,
+                    );
+                    return;
+                }
+            };
         self.open_model_popup_with_presets(presets);
     }
 
@@ -4098,7 +4103,7 @@ impl ChatWidget {
 
         let header = self.model_menu_header(
             "Select Model and Effort",
-            "Access legacy models by running codex -m <model_name> or in your config.toml",
+            "Access legacy models by running codey -m <model_name> or in your config.toml",
         );
         self.bottom_pane.show_selection_view(SelectionViewParams {
             footer_hint: Some("Press enter to select reasoning effort, or esc to dismiss.".into()),
@@ -5215,7 +5220,7 @@ impl ChatWidget {
     fn current_model_supports_personality(&self) -> bool {
         let model = self.current_model();
         self.models_manager
-            .try_list_models(&self.config)
+            .try_list_picker_models(&self.config)
             .ok()
             .and_then(|models| {
                 models
@@ -5329,7 +5334,7 @@ impl ChatWidget {
         }
         match self.active_mode_kind() {
             ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
-            ModeKind::Code => None,
+            ModeKind::Code => Some(CollaborationModeIndicator::Code),
             ModeKind::PairProgramming => Some(CollaborationModeIndicator::PairProgramming),
             ModeKind::Execute => Some(CollaborationModeIndicator::Execute),
             ModeKind::Custom => None,
@@ -5455,7 +5460,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let resume_cmd = codex_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codex resume {name}"));
+            .unwrap_or_else(|| format!("codey resume {name}"));
         let name = name.to_string();
         let line = vec![
             "• ".into(),

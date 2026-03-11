@@ -86,7 +86,7 @@ codex --sandbox workspace-write
 codex --sandbox danger-full-access
 ```
 
-The same setting can be persisted in `~/.codex/config.toml` via the top-level `sandbox_mode = "MODE"` key, e.g. `sandbox_mode = "workspace-write"`.
+The same setting can be persisted in `~/.codey/config.toml` via the top-level `sandbox_mode = "MODE"` key, e.g. `sandbox_mode = "workspace-write"`.
 
 ## Code Organization
 

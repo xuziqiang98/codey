@@ -30,6 +30,8 @@ fn sse_completed(id: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_thread_is_recorded_in_state_db() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.features.enable(Feature::Sqlite);
@@ -67,6 +69,8 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backfill_scans_existing_rollouts() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = start_mock_server().await;
 
     let uuid = Uuid::now_v7();
@@ -160,6 +164,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_messages_persist_in_state_db() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = start_mock_server().await;
     mount_sse_sequence(
         &server,
@@ -207,6 +213,8 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tool_call_logs_include_thread_id() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = start_mock_server().await;
     let call_id = "call-1";
     let args = json!({

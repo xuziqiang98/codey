@@ -172,6 +172,7 @@ impl TestCodexBuilder {
         let auth = self.auth.clone();
         let thread_manager = ThreadManager::with_models_provider_and_home(
             auth.clone(),
+            config.model_provider_id.as_str(),
             config.model_provider.clone(),
             config.codex_home.clone(),
         );
@@ -213,7 +214,7 @@ impl TestCodexBuilder {
         for hook in self.pre_build_hooks.drain(..) {
             hook(home.path());
         }
-        if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+        if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codey") {
             config.codex_linux_sandbox_exe = Some(path);
         }
 

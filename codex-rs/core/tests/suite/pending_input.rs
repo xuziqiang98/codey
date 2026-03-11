@@ -46,6 +46,8 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_user_input_triggers_follow_up_request_with_deltas() {
+    core_test_support::skip_if_sandbox!();
+
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
 
     let first_chunks = vec![

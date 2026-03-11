@@ -13,6 +13,8 @@ fn sse_completed(id: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hierarchical_agents_appends_to_project_doc_in_user_instructions() {
+    core_test_support::skip_if_sandbox!();
+
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
 
@@ -48,6 +50,8 @@ async fn hierarchical_agents_appends_to_project_doc_in_user_instructions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hierarchical_agents_emits_when_no_project_doc() {
+    core_test_support::skip_if_sandbox!();
+
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp1")).await;
 

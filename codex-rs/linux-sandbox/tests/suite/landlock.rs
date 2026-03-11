@@ -164,9 +164,8 @@ async fn test_timeout() {
 }
 
 /// Helper that runs `cmd` under the Linux sandbox and asserts that the command
-/// does NOT succeed (i.e. returns a non‑zero exit code) **unless** the binary
-/// is missing in which case we silently treat it as an accepted skip so the
-/// suite remains green on leaner CI images.
+/// does NOT succeed. Some tools fail with an immediate sandbox denial, while
+/// others stall until the sandboxed process hits the command timeout.
 #[expect(clippy::expect_used)]
 async fn assert_network_blocked(cmd: &[&str]) {
     let cwd = std::env::current_dir().expect("cwd should exist");
@@ -198,19 +197,19 @@ async fn assert_network_blocked(cmd: &[&str]) {
 
     let output = match result {
         Ok(output) => output,
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output })) => *output,
-        _ => {
-            panic!("expected sandbox denied error, got: {result:?}");
+        Err(CodexErr::Sandbox(SandboxErr::Denied { output } | SandboxErr::Timeout { output })) => {
+            *output
         }
+        _ => panic!("expected sandbox denied or timeout error, got: {result:?}"),
     };
 
     dbg!(&output.stderr.text);
     dbg!(&output.stdout.text);
     dbg!(&output.exit_code);
 
-    // A completely missing binary exits with 127.  Anything else should also
-    // be non‑zero (EPERM from seccomp will usually bubble up as 1, 2, 13…)
-    // If—*and only if*—the command exits 0 we consider the sandbox breached.
+    // A completely missing binary exits with 127. Anything else should also be
+    // non-zero, whether the sandbox rejects the syscall immediately or the
+    // process times out waiting on a blocked network operation.
 
     if output.exit_code == 0 {
         panic!(

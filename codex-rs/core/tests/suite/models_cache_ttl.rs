@@ -39,6 +39,8 @@ const REMOTE_MODEL: &str = "codex-test-ttl";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = MockServer::start().await;
 
     let remote_model = test_remote_model(REMOTE_MODEL, 1);
@@ -69,7 +71,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         .list_models(&config, RefreshStrategy::OnlineIfUncached)
         .await;
 
-    let cache_path = config.codex_home.join(CACHE_FILE);
+    let cache_path = cache_path_for_provider(&config.codex_home, &config.model_provider_id);
     let stale_time = Utc.timestamp_opt(0, 0).single().expect("valid epoch");
     rewrite_cache_timestamp(&cache_path, stale_time).await?;
 
@@ -151,6 +153,23 @@ struct ModelsCache {
     #[serde(default)]
     etag: Option<String>,
     models: Vec<ModelInfo>,
+}
+
+fn cache_path_for_provider(codex_home: &Path, model_provider_id: &str) -> std::path::PathBuf {
+    codex_home
+        .join("remote_models")
+        .join(sanitize_model_provider_id(model_provider_id))
+        .join(CACHE_FILE)
+}
+
+fn sanitize_model_provider_id(model_provider_id: &str) -> String {
+    model_provider_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '_',
+        })
+        .collect()
 }
 
 fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {

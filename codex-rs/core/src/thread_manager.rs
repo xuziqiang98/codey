@@ -1,7 +1,6 @@
 use crate::AuthManager;
 #[cfg(any(test, feature = "test-support"))]
 use crate::CodexAuth;
-#[cfg(any(test, feature = "test-support"))]
 use crate::ModelProviderInfo;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
@@ -73,6 +72,8 @@ impl ThreadManager {
     pub fn new(
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
+        model_provider_id: &str,
+        provider: ModelProviderInfo,
         session_source: SessionSource,
     ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
@@ -83,6 +84,8 @@ impl ThreadManager {
                 models_manager: Arc::new(ModelsManager::new(
                     codex_home.clone(),
                     auth_manager.clone(),
+                    model_provider_id,
+                    provider,
                 )),
                 skills_manager: Arc::new(SkillsManager::new(codex_home)),
                 auth_manager,
@@ -101,7 +104,8 @@ impl ThreadManager {
     pub fn with_models_provider(auth: CodexAuth, provider: ModelProviderInfo) -> Self {
         let temp_dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp codex home: {err}"));
         let codex_home = temp_dir.path().to_path_buf();
-        let mut manager = Self::with_models_provider_and_home(auth, provider, codex_home);
+        let mut manager =
+            Self::with_models_provider_and_home(auth, "test-provider", provider, codex_home);
         manager._test_codex_home_guard = Some(temp_dir);
         manager
     }
@@ -111,6 +115,7 @@ impl ThreadManager {
     /// Used for integration tests: should not be used by ordinary business logic.
     pub fn with_models_provider_and_home(
         auth: CodexAuth,
+        model_provider_id: &str,
         provider: ModelProviderInfo,
         codex_home: PathBuf,
     ) -> Self {
@@ -123,6 +128,7 @@ impl ThreadManager {
                 models_manager: Arc::new(ModelsManager::with_provider(
                     codex_home.clone(),
                     auth_manager.clone(),
+                    model_provider_id,
                     provider,
                 )),
                 skills_manager: Arc::new(SkillsManager::new(codex_home)),
@@ -155,6 +161,17 @@ impl ThreadManager {
         self.state
             .models_manager
             .list_models(config, refresh_strategy)
+            .await
+    }
+
+    pub async fn list_picker_models(
+        &self,
+        config: &Config,
+        refresh_strategy: crate::models_manager::manager::RefreshStrategy,
+    ) -> Vec<ModelPreset> {
+        self.state
+            .models_manager
+            .list_picker_models(config, refresh_strategy)
             .await
     }
 

@@ -11,7 +11,6 @@ use codex_app_server_protocol::AuthMode;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
-use codex_common::oss::ollama_chat_deprecation_notice;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
@@ -58,7 +57,6 @@ mod app;
 mod app_backtrack;
 mod app_event;
 mod app_event_sender;
-mod ascii_animation;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
@@ -73,7 +71,6 @@ mod exec_cell;
 mod exec_command;
 mod external_editor;
 mod file_search;
-mod frames;
 mod get_git_diff;
 mod history_cell;
 pub mod insert_history;
@@ -494,12 +491,14 @@ async fn run_ratatui_app(
                 exit_reason: ExitReason::UserRequested,
             });
         }
-        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
-        if onboarding_result
-            .directory_trust_decision
-            .map(|d| d == TrustDirectorySelection::Trust)
-            .unwrap_or(false)
-        {
+        let should_reload_config = onboarding_result.config_updated
+            || onboarding_result
+                .directory_trust_decision
+                .map(|d| d == TrustDirectorySelection::Trust)
+                .unwrap_or(false);
+
+        // Reload config if onboarding changed trust or switched to a new provider.
+        if should_reload_config {
             load_config_or_exit(
                 cli_kv_overrides.clone(),
                 overrides.clone(),
@@ -513,13 +512,6 @@ async fn run_ratatui_app(
         initial_config
     };
 
-    let ollama_chat_support_notice = match ollama_chat_deprecation_notice(&config).await {
-        Ok(notice) => notice,
-        Err(err) => {
-            tracing::warn!(?err, "Failed to detect Ollama wire API");
-            None
-        }
-    };
     let mut missing_session_exit = |id_str: &str, action: &str| {
         error!("Error finding conversation path: {id_str}");
         restore();
@@ -531,7 +523,7 @@ async fn run_ratatui_app(
             thread_name: None,
             update_action: None,
             exit_reason: ExitReason::Fatal(format!(
-                "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+                "No saved session found with ID {id_str}. Run `codey {action}` without an ID to choose from existing sessions."
             )),
         })
     };
@@ -705,7 +697,6 @@ async fn run_ratatui_app(
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
-        ollama_chat_support_notice,
     )
     .await;
 

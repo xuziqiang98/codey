@@ -10,6 +10,8 @@ const CONFIG_TOML: &str = "config.toml";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_turn_context_does_not_persist_when_config_exists() {
+    core_test_support::skip_if_sandbox!();
+
     let server = start_mock_server().await;
     let initial_contents = "model = \"gpt-4o\"\n";
     let mut builder = test_codex()
@@ -50,6 +52,8 @@ async fn override_turn_context_does_not_persist_when_config_exists() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_turn_context_does_not_create_config_file() {
+    core_test_support::skip_if_sandbox!();
+
     let server = start_mock_server().await;
     let mut builder = test_codex();
     let test = builder.build(&server).await.expect("create conversation");

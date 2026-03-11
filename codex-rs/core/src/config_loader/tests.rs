@@ -231,7 +231,7 @@ async fn returns_empty_when_all_layers_missing() {
     .expect("load layers");
     let user_layer = layers
         .get_user_layer()
-        .expect("expected a user layer even when CODEX_HOME/config.toml does not exist");
+        .expect("expected a user layer even when CODEY_HOME/config.toml does not exist");
     assert_eq!(
         &ConfigLayerEntry {
             name: super::ConfigLayerSource::User {
@@ -765,7 +765,7 @@ async fn project_layer_is_added_when_dot_codex_exists_without_config_toml() -> s
 async fn codex_home_is_not_loaded_as_project_layer_from_home_dir() -> std::io::Result<()> {
     let tmp = tempdir()?;
     let home_dir = tmp.path().join("home");
-    let codex_home = home_dir.join(".codex");
+    let codex_home = home_dir.join(".codey");
     tokio::fs::create_dir_all(&codex_home).await?;
     tokio::fs::write(codex_home.join(CONFIG_TOML_FILE), "foo = \"user\"\n").await?;
 

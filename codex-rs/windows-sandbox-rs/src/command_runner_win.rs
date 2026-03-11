@@ -44,9 +44,9 @@ mod read_acl_mutex;
 #[derive(Debug, Deserialize)]
 struct RunnerRequest {
     policy_json_or_preset: String,
-    // Writable location for logs (sandbox user's .codex).
+    // Writable location for logs (sandbox user's .codey).
     codex_home: PathBuf,
-    // Real user's CODEX_HOME for shared data (caps, config).
+    // Real user's CODEY_HOME for shared data (caps, config).
     real_codex_home: PathBuf,
     cap_sid: String,
     command: Vec<String>,

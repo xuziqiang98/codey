@@ -57,7 +57,7 @@ async fn chat_mode_stream_cli() {
         "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"chat\" }}",
         server.uri()
     );
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let bin = codex_utils_cargo_bin::cargo_bin("codey").unwrap();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -68,7 +68,7 @@ async fn chat_mode_stream_cli() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("CODEY_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("OPENAI_BASE_URL", format!("{}/v1", server.uri()));
 
@@ -142,7 +142,7 @@ async fn exec_cli_applies_model_instructions_file() {
 
     let home = TempDir::new().unwrap();
     let repo_root = repo_root();
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let bin = codex_utils_cargo_bin::cargo_bin("codey").unwrap();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -155,7 +155,7 @@ async fn exec_cli_applies_model_instructions_file() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?\n");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("CODEY_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("OPENAI_BASE_URL", format!("{}/v1", server.uri()));
 
@@ -194,14 +194,14 @@ async fn responses_api_stream_cli() {
     let repo_root = repo_root();
 
     let home = TempDir::new().unwrap();
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let bin = codex_utils_cargo_bin::cargo_bin("codey").unwrap();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("CODEY_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("CODEX_RS_SSE_FIXTURE", fixture)
         .env("OPENAI_BASE_URL", "http://unused.local");
@@ -230,14 +230,14 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     let repo_root = repo_root();
 
     // 4. Run the codex CLI and invoke `exec`, which is what records a session.
-    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let bin = codex_utils_cargo_bin::cargo_bin("codey").unwrap();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
         .arg(&repo_root)
         .arg(&prompt);
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("CODEY_HOME", home.path())
         .env(CODEX_API_KEY_ENV_VAR, "dummy")
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         // Required for CLI arg parsing even though fixture short-circuits network usage.
@@ -351,7 +351,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Second run: resume should update the existing file.
     let marker2 = format!("integration-resume-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
-    let bin2 = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let bin2 = codex_utils_cargo_bin::cargo_bin("codey").unwrap();
     let mut cmd2 = AssertCommand::new(bin2);
     cmd2.arg("exec")
         .arg("--skip-git-repo-check")
@@ -360,7 +360,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .arg(&prompt2)
         .arg("resume")
         .arg("--last");
-    cmd2.env("CODEX_HOME", home.path())
+    cmd2.env("CODEY_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local");

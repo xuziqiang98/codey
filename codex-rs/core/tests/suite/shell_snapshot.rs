@@ -243,6 +243,8 @@ async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linux_shell_command_uses_shell_snapshot() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let command = "echo shell-command-snapshot-linux";
     let run = run_shell_command_snapshot(command).await?;
 
@@ -263,6 +265,8 @@ async fn linux_shell_command_uses_shell_snapshot() -> Result<()> {
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let builder = test_codex().with_config(|config| {
         config.features.enable(Feature::ShellSnapshot);
         config.include_apply_patch_tool = true;
@@ -328,6 +332,8 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_snapshot_deleted_after_shutdown_with_skills() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let builder = test_codex().with_config(|config| {
         config.features.enable(Feature::ShellSnapshot);
     });

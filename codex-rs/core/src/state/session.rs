@@ -1,11 +1,16 @@
 //! Session-wide mutable state.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
+use crate::dynamic_context_window::DynamicContextWindowKey;
+use crate::dynamic_context_window::DynamicContextWindowState;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -15,6 +20,8 @@ use crate::truncate::TruncationPolicy;
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
+    pub(crate) dynamic_context_windows:
+        HashMap<DynamicContextWindowKey, Arc<Mutex<DynamicContextWindowState>>>,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) dependency_env: HashMap<String, String>,
@@ -33,6 +40,7 @@ impl SessionState {
         Self {
             session_configuration,
             history,
+            dynamic_context_windows: HashMap::new(),
             latest_rate_limits: None,
             server_reasoning_included: false,
             dependency_env: HashMap::new(),
@@ -56,6 +64,16 @@ impl SessionState {
 
     pub(crate) fn replace_history(&mut self, items: Vec<ResponseItem>) {
         self.history.replace(items);
+    }
+
+    pub(crate) fn get_or_create_dynamic_context_window(
+        &mut self,
+        key: DynamicContextWindowKey,
+    ) -> Arc<Mutex<DynamicContextWindowState>> {
+        self.dynamic_context_windows
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(DynamicContextWindowState::new())))
+            .clone()
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {

@@ -17,11 +17,16 @@ use anyhow::bail;
 use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::time::sleep;
 use tracing::Instrument;
 use tracing::info_span;
+
+#[cfg(unix)]
+use codex_utils_pty::process_group::kill_child_process_group;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellSnapshot {
@@ -197,18 +202,81 @@ async fn run_script_with_timeout(
         });
     }
     handler.kill_on_drop(true);
-    let output = timeout(snapshot_timeout, handler.output())
-        .await
-        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?
-        .with_context(|| format!("Failed to execute {shell_name}"))?;
+    handler.stdout(Stdio::piped());
+    handler.stderr(Stdio::piped());
 
-    if !output.status.success() {
-        let status = output.status;
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut child = handler
+        .spawn()
+        .with_context(|| format!("Failed to execute {shell_name}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("stdout pipe was unexpectedly not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("stderr pipe was unexpectedly not available"))?;
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
+    let status = wait_for_snapshot_or_timeout(&mut child, snapshot_timeout, shell_name).await?;
+    let stdout = join_snapshot_stream(stdout_handle).await?;
+    let stderr = join_snapshot_stream(stderr_handle).await?;
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         bail!("Snapshot command exited with status {status}: {stderr}");
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+async fn wait_for_snapshot_or_timeout(
+    child: &mut Child,
+    snapshot_timeout: Duration,
+    shell_name: &str,
+) -> Result<std::process::ExitStatus> {
+    tokio::select! {
+        status = child.wait() => status.with_context(|| format!("Failed to execute {shell_name}")),
+        _ = sleep(snapshot_timeout) => {
+            terminate_snapshot_child(child)?;
+            let _ = child.wait().await;
+            Err(anyhow!("Snapshot command timed out for {shell_name}"))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_snapshot_child(child: &mut Child) -> Result<()> {
+    kill_child_process_group(child)?;
+    child.start_kill()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_snapshot_child(child: &mut Child) -> Result<()> {
+    child.start_kill()?;
+    Ok(())
+}
+
+async fn join_snapshot_stream(
+    handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    match handle.await {
+        Ok(result) => result.map_err(Into::into),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn excluded_exports_regex() -> String {

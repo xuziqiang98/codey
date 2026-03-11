@@ -509,7 +509,7 @@ fn build_payload_roots(
 }
 
 fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> Vec<PathBuf> {
-    // Never grant capability write access to CODEX_HOME or anything under CODEX_HOME/.sandbox.
+    // Never grant capability write access to CODEY_HOME or anything under CODEY_HOME/.sandbox.
     // These locations contain sandbox control/state and must remain tamper-resistant.
     let codex_home_key = crate::audit::normalize_path_key(codex_home);
     let sbx_dir_key = crate::audit::normalize_path_key(&sandbox_dir(codex_home));

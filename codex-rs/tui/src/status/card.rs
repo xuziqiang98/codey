@@ -8,6 +8,7 @@ use chrono::Local;
 use codex_common::summarize_sandbox_policy;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_core::protocol::NetworkAccess;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::TokenUsage;
@@ -67,6 +68,8 @@ struct StatusHistoryCell {
     agents_summary: String,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
+    show_limits: bool,
+    show_usage_note: bool,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
     session_id: Option<String>,
@@ -170,6 +173,14 @@ impl StatusHistoryCell {
         let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
         let account = compose_account_display(auth_manager, plan_type);
+        let show_limits = matches!(account, Some(StatusAccountDisplay::ChatGpt { .. }))
+            && config.model_provider.is_openai()
+            && !ModelsManager::is_configured_custom_model(
+                &model_name,
+                config,
+                auth_manager.get_internal_auth_mode(),
+            );
+        let show_usage_note = show_limits;
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -200,6 +211,8 @@ impl StatusHistoryCell {
             agents_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
             model_provider,
+            show_limits,
+            show_usage_note,
             account,
             thread_name,
             session_id,
@@ -353,7 +366,7 @@ impl HistoryCell for StatusHistoryCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(vec![
             Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
-            Span::from("OpenAI Codex").bold(),
+            Span::from("Codey").bold(),
             Span::from(" ").dim(),
             Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
         ]));
@@ -407,27 +420,31 @@ impl HistoryCell for StatusHistoryCell {
             push_label(&mut labels, &mut seen, "Context window");
         }
 
-        self.collect_rate_limit_labels(&mut seen, &mut labels);
+        if self.show_limits {
+            self.collect_rate_limit_labels(&mut seen, &mut labels);
+        }
 
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
 
-        let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            "https://chatgpt.com/codex/settings/usage"
-                .cyan()
-                .underlined(),
-            Span::from(" for up-to-date").cyan(),
-        ]);
-        let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
-        ]);
-        let note_lines = word_wrap_lines(
-            [note_first_line, note_second_line],
-            RtOptions::new(available_inner_width),
-        );
-        lines.extend(note_lines);
-        lines.push(Line::from(Vec::<Span<'static>>::new()));
+        if self.show_usage_note {
+            let note_first_line = Line::from(vec![
+                Span::from("Visit ").cyan(),
+                "https://chatgpt.com/codex/settings/usage"
+                    .cyan()
+                    .underlined(),
+                Span::from(" for up-to-date").cyan(),
+            ]);
+            let note_second_line = Line::from(vec![
+                Span::from("information on rate limits and credits").cyan(),
+            ]);
+            let note_lines = word_wrap_lines(
+                [note_first_line, note_second_line],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(note_lines);
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
 
         let mut model_spans = vec![Span::from(self.model_name.clone())];
         if !self.model_details.is_empty() {
@@ -476,7 +493,9 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(formatter.line("Context window", spans));
         }
 
-        lines.extend(self.rate_limit_lines(available_inner_width, &formatter));
+        if self.show_limits {
+            lines.extend(self.rate_limit_lines(available_inner_width, &formatter));
+        }
 
         let content_width = lines.iter().map(line_display_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);

@@ -1,10 +1,14 @@
 use super::new_status_output;
 use super::rate_limit_snapshot_display;
 use crate::history_cell::HistoryCell;
+use base64::Engine;
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
 use chrono::Utc;
+use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
+use codex_core::auth::AuthDotJson;
+use codex_core::auth::save_auth;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::models_manager::manager::ModelsManager;
@@ -19,6 +23,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ReasoningEffort;
 use insta::assert_snapshot;
 use ratatui::prelude::*;
+use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -36,6 +41,57 @@ fn test_auth_manager(config: &Config) -> AuthManager {
         false,
         config.cli_auth_credentials_store_mode,
     )
+}
+
+fn write_chatgpt_auth(config: &Config) {
+    let header = json!({
+        "alg": "none",
+        "typ": "JWT",
+    });
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "user_id": "user-12345",
+        },
+    });
+    let b64 = |value: &serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(value).expect("serialize jwt segment"))
+    };
+    let raw_jwt = format!("{}.{}.{}", b64(&header), b64(&payload), b64(&json!("sig")));
+    let auth_json = json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": raw_jwt,
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token"
+        },
+        "last_refresh": Utc::now(),
+    });
+    let auth_file = config.codex_home.join("auth.json");
+    std::fs::write(
+        auth_file,
+        serde_json::to_string_pretty(&auth_json).expect("serialize auth json"),
+    )
+    .expect("write chatgpt auth");
+}
+
+fn write_api_key_auth(config: &Config) {
+    let auth_json = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("sk-test-key".to_string()),
+        tokens: None,
+        last_refresh: None,
+    };
+    save_auth(
+        &config.codex_home,
+        &auth_json,
+        config.cli_auth_credentials_store_mode,
+    )
+    .expect("write api key auth");
 }
 
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
@@ -60,10 +116,25 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
         .collect()
 }
 
-fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+fn sanitize_rendered_lines(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
-        .map(|line| {
+        .map(|mut line| {
+            if let (Some(version_pos), Some(pipe_idx)) = (line.find("Codey (v"), line.rfind('│'))
+            {
+                let prefix = &line[..version_pos];
+                let suffix = &line[pipe_idx..];
+                let content_width = pipe_idx.saturating_sub(version_pos);
+                let replacement = "Codey (v0.0.0)";
+                let mut rebuilt = prefix.to_string();
+                rebuilt.push_str(replacement);
+                if content_width > replacement.len() {
+                    rebuilt.push_str(&" ".repeat(content_width - replacement.len()));
+                }
+                rebuilt.push_str(suffix);
+                line = rebuilt;
+            }
+
             if let (Some(dir_pos), Some(pipe_idx)) = (line.find("Directory: "), line.rfind('│')) {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
                 let suffix = &line[pipe_idx..];
@@ -107,6 +178,7 @@ async fn status_snapshot_includes_reasoning_details() {
         .expect("set sandbox policy");
 
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -162,7 +234,7 @@ async fn status_snapshot_includes_reasoning_details() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -173,6 +245,7 @@ async fn status_snapshot_includes_forked_from() {
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -216,7 +289,7 @@ async fn status_snapshot_includes_forked_from() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -227,6 +300,7 @@ async fn status_snapshot_includes_monthly_limit() {
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -276,7 +350,7 @@ async fn status_snapshot_includes_monthly_limit() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -284,6 +358,7 @@ async fn status_snapshot_includes_monthly_limit() {
 async fn status_snapshot_shows_unlimited_credits() {
     let temp_home = TempDir::new().expect("temp home");
     let config = test_config(&temp_home).await;
+    write_chatgpt_auth(&config);
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage::default();
     let captured_at = chrono::Local
@@ -331,6 +406,7 @@ async fn status_snapshot_shows_unlimited_credits() {
 async fn status_snapshot_shows_positive_credits() {
     let temp_home = TempDir::new().expect("temp home");
     let config = test_config(&temp_home).await;
+    write_chatgpt_auth(&config);
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage::default();
     let captured_at = chrono::Local
@@ -465,6 +541,246 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
 }
 
 #[tokio::test]
+async fn status_snapshot_hides_usage_note_for_configured_custom_model() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("mock-model".to_string());
+    config.model_provider_id = "mock-provider".to_string();
+    config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        now,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .all(|line| !line.contains("https://chatgpt.com/codex/settings/usage")),
+        "expected no usage note for configured custom model, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_hides_usage_note_for_custom_provider_with_official_model_name() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.2-codex".to_string());
+    config.model_provider_id = "mock-provider".to_string();
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        now,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .all(|line| !line.contains("https://chatgpt.com/codex/settings/usage")),
+        "expected no usage note for custom provider, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_hides_limits_for_api_key_auth() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests");
+    write_api_key_auth(&config);
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage {
+        input_tokens: 500,
+        cached_input_tokens: 0,
+        output_tokens: 250,
+        reasoning_output_tokens: 0,
+        total_tokens: 750,
+    };
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+    let snapshot = RateLimitSnapshot {
+        primary: Some(RateLimitWindow {
+            used_percent: 45.0,
+            window_minutes: Some(300),
+            resets_at: Some(reset_at_from(&captured_at, 900)),
+        }),
+        secondary: None,
+        credits: Some(CreditsSnapshot {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("37.5".to_string()),
+        }),
+        plan_type: None,
+    };
+    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        Some(&rate_display),
+        None,
+        captured_at,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("Account:") && line.contains("API key configured")),
+        "expected API key account line, got {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.contains("Context window:")),
+        "expected context window line, got {rendered:?}"
+    );
+    assert!(
+        rendered.iter().all(|line| {
+            !line.contains("https://chatgpt.com/codex/settings/usage")
+                && !line.contains("5h limit:")
+                && !line.contains("Weekly limit:")
+                && !line.contains("Credits:")
+                && !line.contains("Limits:")
+        }),
+        "expected limits and usage note to stay hidden for API key auth, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_hides_limits_for_chatgpt_custom_model() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("mock-model".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.model_context_window = Some(272_000);
+    config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage {
+        input_tokens: 500,
+        cached_input_tokens: 0,
+        output_tokens: 250,
+        reasoning_output_tokens: 0,
+        total_tokens: 750,
+    };
+    let token_info = TokenUsageInfo {
+        total_token_usage: usage.clone(),
+        last_token_usage: usage.clone(),
+        model_context_window: config.model_context_window,
+    };
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 6, 7, 8, 9, 10)
+        .single()
+        .expect("timestamp");
+    let snapshot = RateLimitSnapshot {
+        primary: Some(RateLimitWindow {
+            used_percent: 45.0,
+            window_minutes: Some(300),
+            resets_at: Some(reset_at_from(&captured_at, 900)),
+        }),
+        secondary: None,
+        credits: Some(CreditsSnapshot {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("37.5".to_string()),
+        }),
+        plan_type: None,
+    };
+    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &None,
+        None,
+        None,
+        Some(&rate_display),
+        None,
+        captured_at,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered = render_lines(&composite.display_lines(120));
+
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("Context window:") && line.contains("750 used / 272K")),
+        "expected context window line for custom model, got {rendered:?}"
+    );
+    assert!(
+        rendered.iter().all(|line| {
+            !line.contains("https://chatgpt.com/codex/settings/usage")
+                && !line.contains("5h limit:")
+                && !line.contains("Weekly limit:")
+                && !line.contains("Credits:")
+                && !line.contains("Limits:")
+        }),
+        "expected limits and usage note to stay hidden for custom model, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn status_card_token_usage_excludes_cached_tokens() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
@@ -518,6 +834,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     config.model_provider_id = "openai".to_string();
     config.model_reasoning_summary = ReasoningSummary::Detailed;
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -568,7 +885,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
 
     assert_snapshot!(sanitized);
 }
@@ -579,6 +896,7 @@ async fn status_snapshot_shows_missing_limits_message() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -617,7 +935,7 @@ async fn status_snapshot_shows_missing_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -625,8 +943,9 @@ async fn status_snapshot_shows_missing_limits_message() {
 async fn status_snapshot_includes_credits_and_limits() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
-    config.model = Some("gpt-5.1-codex".to_string());
+    config.model = Some("gpt-5.1-codex-max".to_string());
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -684,7 +1003,7 @@ async fn status_snapshot_includes_credits_and_limits() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -694,6 +1013,7 @@ async fn status_snapshot_shows_empty_limits_message() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -739,7 +1059,7 @@ async fn status_snapshot_shows_empty_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -749,6 +1069,7 @@ async fn status_snapshot_shows_stale_limits_message() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -803,7 +1124,7 @@ async fn status_snapshot_shows_stale_limits_message() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 
@@ -811,8 +1132,9 @@ async fn status_snapshot_shows_stale_limits_message() {
 async fn status_snapshot_cached_limits_hide_credits_without_flag() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
-    config.model = Some("gpt-5.1-codex".to_string());
+    config.model = Some("gpt-5.1-codex-max".to_string());
     config.cwd = PathBuf::from("/workspace/tests");
+    write_chatgpt_auth(&config);
 
     let auth_manager = test_auth_manager(&config);
     let usage = TokenUsage {
@@ -871,7 +1193,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
             *line = line.replace('\\', "/");
         }
     }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let sanitized = sanitize_rendered_lines(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
 }
 

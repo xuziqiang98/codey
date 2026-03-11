@@ -30,17 +30,17 @@ use once_cell::sync::Lazy;
 #[serde(rename_all = "lowercase")]
 pub enum AuthCredentialsStoreMode {
     #[default]
-    /// Persist credentials in CODEX_HOME/auth.json.
+    /// Persist credentials in CODEY_HOME/auth.json.
     File,
     /// Persist credentials in the keyring. Fail if unavailable.
     Keyring,
-    /// Use keyring when available; otherwise, fall back to a file in CODEX_HOME.
+    /// Use keyring when available; otherwise, fall back to a file in CODEY_HOME.
     Auto,
     /// Store credentials in memory only for the current process.
     Ephemeral,
 }
 
-/// Expected structure for $CODEX_HOME/auth.json.
+/// Expected structure for $CODEY_HOME/auth.json.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,7 +85,7 @@ impl FileAuthStorage {
         Self { codex_home }
     }
 
-    /// Attempt to read and parse the `auth.json` file in the given `CODEX_HOME` directory.
+    /// Attempt to read and parse the `auth.json` file in the given `CODEY_HOME` directory.
     /// Returns the full AuthDotJson structure.
     pub(super) fn try_read_auth_json(&self, auth_file: &Path) -> std::io::Result<AuthDotJson> {
         let mut file = File::open(auth_file)?;
@@ -546,11 +546,11 @@ mod tests {
 
     #[test]
     fn keyring_auth_storage_compute_store_key_for_home_directory() -> anyhow::Result<()> {
-        let codex_home = PathBuf::from("~/.codex");
+        let codex_home = PathBuf::from("~/.codey");
 
         let key = compute_store_key(codex_home.as_path())?;
 
-        assert_eq!(key, "cli|940db7b1d0e4eb40");
+        assert_eq!(key, "cli|3807e5858a205f26");
         Ok(())
     }
 

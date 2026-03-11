@@ -41,7 +41,14 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::process::Command as StdCommand;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 // --- Test helpers -----------------------------------------------------------
 
 pub(super) const FIRST_REPLY: &str = "FIRST_REPLY";
@@ -97,6 +104,20 @@ fn body_contains_text(body: &str, text: &str) -> bool {
     body.contains(&json_fragment(text))
 }
 
+fn contains_user_text(input: &[serde_json::Value], expected: &str) -> bool {
+    input.iter().any(|item| {
+        item.get("type").and_then(|v| v.as_str()) == Some("message")
+            && item.get("role").and_then(|v| v.as_str()) == Some("user")
+            && item
+                .get("content")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|entry| entry.get("text").and_then(|v| v.as_str()) == Some(expected))
+                })
+    })
+}
+
 fn json_fragment(text: &str) -> String {
     serde_json::to_string(text)
         .expect("serialize text to JSON")
@@ -109,6 +130,58 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     provider.name = "OpenAI (test)".into();
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider
+}
+
+fn unknown_chat_model_provider(server: &MockServer) -> ModelProviderInfo {
+    let mut provider = non_openai_model_provider(server);
+    provider.wire_api = codex_core::WireApi::Chat;
+    provider.supports_websockets = false;
+    provider
+}
+
+fn ripgrep_available() -> bool {
+    StdCommand::new("rg")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn chat_sse_delta_and_stop(text: &str) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&json!({
+            "choices": [{"delta": {"content": text}, "finish_reason": "stop"}]
+        }))
+        .expect("serialize chat stop response")
+    )
+}
+
+fn chat_sse_length() -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&json!({
+            "choices": [{"delta": {}, "finish_reason": "length"}]
+        }))
+        .expect("serialize chat length response")
+    )
+}
+
+struct ChatSeqResponder {
+    num_calls: AtomicUsize,
+    bodies: Vec<String>,
+}
+
+impl wiremock::Respond for ChatSeqResponder {
+    fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let idx = self.num_calls.fetch_add(1, Ordering::SeqCst);
+        match self.bodies.get(idx) {
+            Some(body) => ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body.clone()),
+            None => panic!("no chat completion response for index {idx}"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1759,6 +1832,9 @@ async fn manual_compact_retries_after_context_window_error() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
+    for (idx, request) in requests.iter().enumerate() {
+        eprintln!("first_test_request[{idx}]={}", request.body_json());
+    }
     assert_eq!(
         requests.len(),
         3,
@@ -1903,21 +1979,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         5,
         "expected exactly 5 requests (user turn, compact, user turn, compact, final turn)"
     );
-    let contains_user_text = |input: &[serde_json::Value], expected: &str| -> bool {
-        input.iter().any(|item| {
-            item.get("type").and_then(|v| v.as_str()) == Some("message")
-                && item.get("role").and_then(|v| v.as_str()) == Some("user")
-                && item
-                    .get("content")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|arr| {
-                        arr.iter().any(|entry| {
-                            entry.get("text").and_then(|v| v.as_str()) == Some(expected)
-                        })
-                    })
-        })
-    };
-
     let first_turn_input = requests[0].input();
     assert!(
         contains_user_text(&first_turn_input, first_user_message),
@@ -2130,32 +2191,28 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
 
     let server = start_mock_server().await;
 
-    let context_window = 100;
-    let limit = context_window * 90 / 100;
-    let over_limit_tokens = context_window * 95 / 100 + 1;
+    let context_window = 20_000;
+    let limit = 1;
     let follow_up_user = "FOLLOW_UP_AFTER_LIMIT";
 
     let first_turn = sse(vec![
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
         ev_completed_with_tokens("r1", 50),
     ]);
-    let function_call_follow_up = sse(vec![
-        ev_assistant_message("m2", FINAL_REPLY),
-        ev_completed_with_tokens("r2", over_limit_tokens),
-    ]);
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
-        ev_assistant_message("m3", &auto_summary_payload),
+        ev_assistant_message("m2", &auto_summary_payload),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let post_compact_follow_up = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
         ev_completed_with_tokens("r3", 10),
     ]);
-    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r4", 10)]);
-
-    // Mount responses in order and keep mocks only for the ones we assert on.
-    let first_turn_mock = mount_sse_once(&server, first_turn).await;
-    let follow_up_mock = mount_sse_once(&server, function_call_follow_up).await;
-    let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
-    // We don't assert on the post-compact request, so no need to keep its mock.
-    mount_sse_once(&server, post_auto_compact_turn).await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![first_turn, auto_compact_turn, post_compact_follow_up],
+    )
+    .await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2194,7 +2251,14 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
     wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
 
     // Assert first request captured expected user message that triggers function call.
-    let first_request = first_turn_mock.single_request().input();
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected request, same-turn auto compact, and post-compact follow-up"
+    );
+
+    let first_request = requests[0].input();
     assert!(
         first_request.iter().any(|item| {
             item.get("type").and_then(|value| value.as_str()) == Some("message")
@@ -2209,22 +2273,197 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
         "first request should include the user message that triggers the function call"
     );
 
-    let function_call_output = follow_up_mock
-        .single_request()
-        .function_call_output(DUMMY_CALL_ID);
-    let output_text = function_call_output
-        .get("output")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
+    let compact_body = requests[1].body_json().to_string();
     assert!(
-        output_text.contains(DUMMY_FUNCTION_NAME),
-        "function call output should be sent before auto compact"
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "auto compact request should include the summarization prompt after exceeding the auto-compact limit ({limit})"
     );
 
-    let auto_compact_body = auto_compact_mock.single_request().body_json().to_string();
+    let post_compact_body = requests[2].body_json().to_string();
     assert!(
-        body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
-        "auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
+        body_contains_text(
+            &post_compact_body,
+            &summary_with_prefix(&auto_summary_payload)
+        ),
+        "post-compact follow-up should use compacted history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_triggers_when_tool_output_pushes_next_step_over_limit() {
+    skip_if_no_network!();
+    if !ripgrep_available() {
+        eprintln!("rg not available in PATH; skipping test");
+        return;
+    }
+
+    let server = start_mock_server().await;
+    let search_dir_name = "grep-auto-compact";
+    let call_id = "grep-files-auto-compact";
+    let arguments = json!({
+        "pattern": "needle",
+        "path": search_dir_name,
+        "limit": 400,
+    })
+    .to_string();
+
+    let first_turn = sse(vec![
+        ev_function_call(call_id, "grep_files", &arguments),
+        ev_completed_with_tokens("r1", 50),
+    ]);
+    let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
+    let auto_compact_turn = sse(vec![
+        ev_assistant_message("m2", &auto_summary_payload),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let post_compact_follow_up = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 20),
+    ]);
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![first_turn, auto_compact_turn, post_compact_follow_up],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(20_000);
+            config.model_auto_compact_token_limit = Some(1_200);
+        });
+    let test = builder.build(&server).await.unwrap();
+
+    let search_dir = test.cwd.path().join(search_dir_name);
+    std::fs::create_dir_all(&search_dir).unwrap();
+    for idx in 0..250 {
+        let file_name = format!("needle_match_file_{idx:03}_aaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt");
+        std::fs::write(search_dir.join(file_name), "needle\n").unwrap();
+    }
+
+    test.submit_turn("search for needle matches").await.unwrap();
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected request, same-turn auto compact, and post-compact follow-up"
+    );
+
+    let compact_request = &requests[1];
+    let compact_body = compact_request.body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "second request should be the auto compact request"
+    );
+
+    let compact_tool_output = compact_request
+        .function_call_output_text(call_id)
+        .expect("auto compact request should include the stored tool output");
+    assert!(
+        compact_tool_output.contains("needle_match_file_000"),
+        "auto compact should run after the grep_files output is recorded"
+    );
+
+    let follow_up_body = requests[2].body_json().to_string();
+    assert!(
+        body_contains_text(&follow_up_body, &summary_with_prefix(&auto_summary_payload)),
+        "post-compact follow-up should use compacted history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preflight_auto_compact_runs_before_initial_request_when_input_exceeds_effective_context_window()
+ {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
+    let preflight_compact_turn = sse(vec![
+        ev_assistant_message("m1", &auto_summary_payload),
+        ev_completed_with_tokens("r1", 10),
+    ]);
+    let post_compact_turn = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![preflight_compact_turn, post_compact_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(400);
+    });
+    let test = builder.build(&server).await.unwrap();
+
+    let large_user_message = "preflight-overflow ".repeat(200);
+    test.submit_turn(&large_user_message).await.unwrap();
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected preflight compact request followed by the post-compact request"
+    );
+
+    let compact_body = requests[0].body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "first request should be the preflight compact request"
+    );
+    assert!(
+        body_contains_text(&compact_body, &large_user_message),
+        "preflight compact should include the oversized user message in history"
+    );
+
+    let follow_up_body = requests[1].body_json().to_string();
+    assert!(
+        body_contains_text(&follow_up_body, &summary_with_prefix(&auto_summary_payload)),
+        "post-compact request should use compacted history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preflight_auto_compact_skips_request_that_fits_effective_context_window() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_assistant_message("m1", FINAL_REPLY),
+            ev_completed_with_tokens("r1", 10),
+        ])],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(100_000);
+    });
+    let test = builder.build(&server).await.unwrap();
+
+    test.submit_turn("small preflight-safe prompt")
+        .await
+        .unwrap();
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "request under the effective context window should not preflight compact"
+    );
+    let first_input = requests[0].input();
+    assert!(
+        !contains_user_text(&first_input, SUMMARIZATION_PROMPT),
+        "first request should be the normal turn request"
     );
 }
 
@@ -2434,5 +2673,155 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         compact_requests.len(),
         1,
         "remote compaction should run once after the reasoning header clears"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_chat_model_upgrades_context_window_after_large_success() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let chat_seq = ChatSeqResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies: vec![
+            chat_sse_delta_and_stop("first reply"),
+            chat_sse_delta_and_stop("second reply"),
+        ],
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(chat_seq)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let model_provider = unknown_chat_model_provider(&server);
+    let large_input = "a".repeat(100_000);
+
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model = Some("unknown-chat-model".to_string());
+            config.model_provider = model_provider;
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: large_input,
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit large turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "follow up".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit follow-up turn");
+
+    let model_context_window = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::TurnStarted(event) => Some(event.model_context_window),
+        _ => None,
+    })
+    .await;
+    assert_eq!(model_context_window, Some(121_600));
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_chat_model_context_limit_compacts_and_retries() {
+    skip_if_no_network!();
+
+    enum TerminalEvent {
+        TurnComplete,
+        Error(String),
+    }
+
+    let server = MockServer::start().await;
+    let chat_seq = ChatSeqResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies: vec![
+            chat_sse_length(),
+            chat_sse_delta_and_stop(AUTO_SUMMARY_TEXT),
+            chat_sse_delta_and_stop(FINAL_REPLY),
+        ],
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(chat_seq)
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let model_provider = unknown_chat_model_provider(&server);
+    let large_input = "b".repeat(140_000);
+
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model = Some("unknown-chat-model".to_string());
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: large_input.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit large turn");
+
+    let terminal = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::TurnComplete(_) => Some(TerminalEvent::TurnComplete),
+        EventMsg::Error(err) => Some(TerminalEvent::Error(err.message.clone())),
+        _ => None,
+    })
+    .await;
+    match terminal {
+        TerminalEvent::TurnComplete => {}
+        TerminalEvent::Error(message) => panic!("unexpected error event: {message}"),
+    }
+
+    let requests = server.received_requests().await.expect("capture requests");
+    let chat_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chat_requests.len(),
+        3,
+        "expected initial, compact, and retry requests"
+    );
+
+    let compact_body = String::from_utf8_lossy(&chat_requests[1].body);
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "compact request should include the summarization prompt"
+    );
+
+    let retry_body = String::from_utf8_lossy(&chat_requests[2].body);
+    assert!(
+        body_contains_text(&retry_body, AUTO_SUMMARY_TEXT),
+        "retry request should include the compacted summary"
     );
 }

@@ -2,7 +2,7 @@
 //!
 //! Providers can be defined in two places:
 //!   1. Built-in defaults compiled into the binary so Codex works out-of-the-box.
-//!   2. User-defined entries inside `~/.codex/config.toml` under the `model_providers`
+//!   2. User-defined entries inside `~/.codey/config.toml` under the `model_providers`
 //!      key. These override or extend the defaults at runtime.
 
 use crate::auth::AuthMode;
@@ -28,8 +28,6 @@ const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
-pub const CHAT_WIRE_API_DEPRECATION_SUMMARY: &str = r#"Support for the "chat" wire API is deprecated and will soon be removed. Update your model provider definition in config.toml to use wire_api = "responses"."#;
-
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 
 /// Wire protocol that the provider speaks. Most third-party services only
@@ -204,6 +202,17 @@ impl ModelProviderInfo {
             }
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn has_local_auth(&self) -> bool {
+        self.experimental_bearer_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+            || self
+                .env_key
+                .as_deref()
+                .and_then(|env_key| std::env::var(env_key).ok())
+                .is_some_and(|value| !value.trim().is_empty())
     }
 
     /// Effective maximum number of request retries for this provider.

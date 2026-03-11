@@ -3361,32 +3361,37 @@ mod tests {
             composer.set_context_window(Some(context_percent), None);
         }
 
-        // Empty textarea, agent idle: shortcuts hint can show, and cycle hint is hidden.
-        snapshot_composer_state_with_width("footer_collapse_empty_full", 120, true, |composer| {
-            setup_collab_footer(composer, 100, None);
-        });
+        // Empty textarea, code mode idle: shortcuts hint and cycle hint are available.
         snapshot_composer_state_with_width(
-            "footer_collapse_empty_mode_cycle_with_context",
+            "footer_collapse_code_empty_full",
+            120,
+            true,
+            |composer| {
+                setup_collab_footer(composer, 100, Some(CollaborationModeIndicator::Code));
+            },
+        );
+        snapshot_composer_state_with_width(
+            "footer_collapse_code_empty_mode_cycle_with_context",
             60,
             true,
             |composer| {
-                setup_collab_footer(composer, 100, None);
+                setup_collab_footer(composer, 100, Some(CollaborationModeIndicator::Code));
             },
         );
         snapshot_composer_state_with_width(
-            "footer_collapse_empty_mode_cycle_without_context",
+            "footer_collapse_code_empty_mode_cycle_without_context",
             44,
             true,
             |composer| {
-                setup_collab_footer(composer, 100, None);
+                setup_collab_footer(composer, 100, Some(CollaborationModeIndicator::Code));
             },
         );
         snapshot_composer_state_with_width(
-            "footer_collapse_empty_mode_only",
+            "footer_collapse_code_empty_mode_only",
             26,
             true,
             |composer| {
-                setup_collab_footer(composer, 100, None);
+                setup_collab_footer(composer, 100, Some(CollaborationModeIndicator::Code));
             },
         );
 
@@ -3424,52 +3429,57 @@ mod tests {
             },
         );
 
-        // Textarea has content, agent running, steer enabled: queue hint is shown.
-        snapshot_composer_state_with_width("footer_collapse_queue_full", 120, true, |composer| {
-            setup_collab_footer(composer, 98, None);
-            composer.set_steer_enabled(true);
-            composer.set_task_running(true);
-            composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
-        });
+        // Textarea has content, code mode active, agent running, steer enabled: queue hint + mode.
         snapshot_composer_state_with_width(
-            "footer_collapse_queue_short_with_context",
+            "footer_collapse_code_queue_full",
+            120,
+            true,
+            |composer| {
+                setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Code));
+                composer.set_steer_enabled(true);
+                composer.set_task_running(true);
+                composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
+            },
+        );
+        snapshot_composer_state_with_width(
+            "footer_collapse_code_queue_short_with_context",
             50,
             true,
             |composer| {
-                setup_collab_footer(composer, 98, None);
+                setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Code));
                 composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
         snapshot_composer_state_with_width(
-            "footer_collapse_queue_message_without_context",
+            "footer_collapse_code_queue_message_without_context",
             40,
             true,
             |composer| {
-                setup_collab_footer(composer, 98, None);
+                setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Code));
                 composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
         snapshot_composer_state_with_width(
-            "footer_collapse_queue_short_without_context",
+            "footer_collapse_code_queue_short_without_context",
             30,
             true,
             |composer| {
-                setup_collab_footer(composer, 98, None);
+                setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Code));
                 composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
         snapshot_composer_state_with_width(
-            "footer_collapse_queue_mode_only",
+            "footer_collapse_code_queue_mode_only",
             20,
             true,
             |composer| {
-                setup_collab_footer(composer, 98, None);
+                setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Code));
                 composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());

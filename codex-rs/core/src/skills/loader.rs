@@ -182,13 +182,13 @@ fn skill_roots_from_layer_stack_inner(config_layer_stack: &ConfigLayerStack) -> 
                 });
             }
             ConfigLayerSource::User { .. } => {
-                // `$CODEX_HOME/skills` (user-installed skills).
+                // `$CODEY_HOME/skills` (user-installed skills).
                 roots.push(SkillRoot {
                     path: config_folder.as_path().join(SKILLS_DIR_NAME),
                     scope: SkillScope::User,
                 });
 
-                // Embedded system skills are cached under `$CODEX_HOME/skills/.system` and are a
+                // Embedded system skills are cached under `$CODEY_HOME/skills/.system` and are a
                 // special case (not a config layer).
                 roots.push(SkillRoot {
                     path: system_cache_root_dir(config_folder.as_path()),
@@ -1377,7 +1377,7 @@ interface:
         let codex_home = tempfile::tempdir().expect("tempdir");
 
         // Create a cycle:
-        //   $CODEX_HOME/skills/cycle/loop -> $CODEX_HOME/skills/cycle
+        //   $CODEY_HOME/skills/cycle/loop -> $CODEY_HOME/skills/cycle
         let cycle_dir = codex_home.path().join("skills/cycle");
         fs::create_dir_all(&cycle_dir).unwrap();
         symlink_dir(&cycle_dir, &cycle_dir.join("loop"));

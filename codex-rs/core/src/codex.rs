@@ -3,9 +3,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -97,7 +95,6 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::ModelProviderInfo;
-use crate::WireApi;
 use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
@@ -112,6 +109,8 @@ use crate::config::resolve_web_search_mode_for_turn;
 use crate::config::types::McpServerConfig;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::context_manager::ContextManager;
+use crate::dynamic_context_window::DynamicContextWindowKey;
+use crate::dynamic_context_window::DynamicContextWindowState;
 use crate::environment_context::EnvironmentContext;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -130,7 +129,6 @@ use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_paths;
 use crate::mentions::collect_tool_mentions_from_messages;
-use crate::model_provider_info::CHAT_WIRE_API_DEPRECATION_SUMMARY;
 use crate::project_doc::get_user_instructions;
 use crate::proposed_plan_parser::ProposedPlanParser;
 use crate::proposed_plan_parser::ProposedPlanSegment;
@@ -243,31 +241,6 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
-static CHAT_WIRE_API_DEPRECATION_EMITTED: AtomicBool = AtomicBool::new(false);
-
-fn maybe_push_chat_wire_api_deprecation(
-    config: &Config,
-    post_session_configured_events: &mut Vec<Event>,
-) {
-    if config.model_provider.wire_api != WireApi::Chat {
-        return;
-    }
-
-    if CHAT_WIRE_API_DEPRECATION_EMITTED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    post_session_configured_events.push(Event {
-        id: INITIAL_SUBMIT_ID.to_owned(),
-        msg: EventMsg::DeprecationNotice(DeprecationNoticeEvent {
-            summary: CHAT_WIRE_API_DEPRECATION_SUMMARY.to_string(),
-            details: None,
-        }),
-    });
-}
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -644,6 +617,24 @@ impl Session {
         per_turn_config
     }
 
+    async fn dynamic_context_window_for_model(
+        &self,
+        config: &Config,
+        model_info: &ModelInfo,
+    ) -> Option<Arc<std::sync::Mutex<DynamicContextWindowState>>> {
+        if config.model_context_window.is_some()
+            || config.model_provider.wire_api != crate::WireApi::Chat
+            || model_info.context_window.is_some()
+        {
+            return None;
+        }
+
+        let key =
+            DynamicContextWindowKey::new(config.model_provider_id.clone(), model_info.slug.clone());
+        let mut state = self.state.lock().await;
+        Some(state.get_or_create_dynamic_context_window(key))
+    }
+
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
@@ -657,6 +648,7 @@ impl Session {
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
         model_info: ModelInfo,
+        dynamic_context_window: Option<Arc<std::sync::Mutex<DynamicContextWindowState>>>,
         conversation_id: ThreadId,
         sub_id: String,
         transport_manager: TransportManager,
@@ -666,10 +658,11 @@ impl Session {
             model_info.slug.as_str(),
         );
         let per_turn_config = Arc::new(per_turn_config);
-        let client = ModelClient::new(
+        let client = ModelClient::new_with_dynamic_context_window(
             per_turn_config.clone(),
             auth_manager,
             model_info.clone(),
+            dynamic_context_window,
             otel_manager,
             provider,
             session_configuration.collaboration_mode.reasoning_effort(),
@@ -839,7 +832,6 @@ impl Session {
                 }),
             });
         }
-        maybe_push_chat_wire_api_deprecation(&config, &mut post_session_configured_events);
         maybe_push_unstable_features_warning(&config, &mut post_session_configured_events);
 
         let auth = auth.as_ref();
@@ -1234,6 +1226,9 @@ impl Session {
                 &per_turn_config,
             )
             .await;
+        let dynamic_context_window = self
+            .dynamic_context_window_for_model(&per_turn_config, &model_info)
+            .await;
         let mut turn_context: TurnContext = Self::make_turn_context(
             Some(Arc::clone(&self.services.auth_manager)),
             &self.services.otel_manager,
@@ -1241,6 +1236,7 @@ impl Session {
             &session_configuration,
             per_turn_config,
             model_info,
+            dynamic_context_window,
             self.conversation_id,
             sub_id,
             self.services.transport_manager.clone(),
@@ -2954,7 +2950,7 @@ mod handlers {
     /// Persists the thread name in the session index, updates in-memory state, and emits
     /// a `ThreadNameUpdated` event on success.
     ///
-    /// This appends the name to `CODEX_HOME/sessions_index.jsonl` via `session_index::append_thread_name` for the
+    /// This appends the name to `CODEY_HOME/sessions_index.jsonl` via `session_index::append_thread_name` for the
     /// current `thread_id`, then updates `SessionConfiguration::thread_name`.
     ///
     /// Returns an error event if the name is empty or session persistence is disabled.
@@ -3142,11 +3138,15 @@ async fn spawn_review_thread(
         .get_otel_manager()
         .with_model(model.as_str(), review_model_info.slug.as_str());
 
+    let dynamic_context_window = sess
+        .dynamic_context_window_for_model(&per_turn_config, &model_info)
+        .await;
     let per_turn_config = Arc::new(per_turn_config);
-    let client = ModelClient::new(
+    let client = ModelClient::new_with_dynamic_context_window(
         per_turn_config.clone(),
         auth_manager,
         model_info.clone(),
+        dynamic_context_window,
         otel_manager,
         provider,
         per_turn_config.model_reasoning_effort,
@@ -3274,15 +3274,13 @@ pub(crate) async fn run_turn(
         return None;
     }
 
-    let model_info = turn_context.client.get_model_info();
-    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let total_usage_tokens = sess.get_total_token_usage().await;
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if total_usage_tokens >= auto_compact_limit {
+    if total_usage_tokens >= auto_compact_limit(turn_context.as_ref()) {
         run_auto_compact(&sess, &turn_context).await;
     }
 
@@ -3380,6 +3378,8 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
     let mut client_session = turn_context.client.new_session();
+    let mut has_sent_sampling_request = false;
+    let mut preflight_compaction_attempted = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -3410,6 +3410,7 @@ pub(crate) async fn run_turn(
         let tool_selection = SamplingRequestToolSelection {
             explicit_app_paths: &explicit_app_paths,
             skill_name_counts_lower: &skill_name_counts_lower,
+            allow_preflight_compact: !has_sent_sampling_request && !preflight_compaction_attempted,
         };
         match run_sampling_request(
             Arc::clone(&sess),
@@ -3423,12 +3424,28 @@ pub(crate) async fn run_turn(
         .await
         {
             Ok(sampling_request_output) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    request_input_tokens,
+                    tool_output_tokens,
                 } = sampling_request_output;
-                let total_usage_tokens = sess.get_total_token_usage().await;
-                let token_limit_reached = total_usage_tokens >= auto_compact_limit;
+                if let Some(input_tokens) = request_input_tokens {
+                    let _ = turn_context
+                        .client
+                        .maybe_upgrade_dynamic_context_window(input_tokens);
+                }
+                let total_usage_tokens = if needs_follow_up {
+                    sess.get_total_token_usage()
+                        .await
+                        .saturating_add(tool_output_tokens)
+                } else {
+                    sess.get_total_token_usage().await
+                };
+                let token_limit_reached =
+                    total_usage_tokens >= auto_compact_limit(turn_context.as_ref());
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
@@ -3450,11 +3467,40 @@ pub(crate) async fn run_turn(
                 }
                 continue;
             }
-            Err(CodexErr::TurnAborted) => {
+            Err(SamplingRequestError::ContextWindowExceeded {
+                request_input_tokens,
+            }) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
+                let should_retry = request_input_tokens.is_some_and(|input_tokens| {
+                    turn_context
+                        .client
+                        .record_dynamic_context_window_retry(&turn_context.sub_id, input_tokens)
+                });
+                if should_retry {
+                    run_auto_compact(&sess, &turn_context).await;
+                    continue;
+                }
+
+                let err = CodexErr::ContextWindowExceeded;
+                sess.set_total_tokens_full(&turn_context).await;
+                info!("Turn error: {err:#}");
+                let event = EventMsg::Error(err.to_error_event(None));
+                sess.send_event(&turn_context, event).await;
+                break;
+            }
+            Err(SamplingRequestError::PreflightCompactRequired) => {
+                preflight_compaction_attempted = true;
+                run_auto_compact(&sess, &turn_context).await;
+                continue;
+            }
+            Err(SamplingRequestError::Codex(CodexErr::TurnAborted)) => {
                 // Aborted turn is reported via a different event.
                 break;
             }
-            Err(CodexErr::InvalidImageRequest()) => {
+            Err(SamplingRequestError::Codex(CodexErr::InvalidImageRequest())) => {
+                has_sent_sampling_request = true;
+                preflight_compaction_attempted = false;
                 let mut state = sess.state.lock().await;
                 error_or_panic(
                     "Invalid image detected; sanitizing tool output to prevent poisoning",
@@ -3470,7 +3516,7 @@ pub(crate) async fn run_turn(
                 sess.send_event(&turn_context, event).await;
                 break;
             }
-            Err(e) => {
+            Err(SamplingRequestError::Codex(e)) => {
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(&turn_context, event).await;
@@ -3481,6 +3527,23 @@ pub(crate) async fn run_turn(
     }
 
     last_agent_message
+}
+
+fn auto_compact_limit(turn_context: &TurnContext) -> i64 {
+    turn_context
+        .client
+        .get_model_info()
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX)
+}
+
+fn should_preflight_compact(turn_context: &TurnContext, request_input_tokens: Option<i64>) -> bool {
+    request_input_tokens.is_some_and(|input_tokens| {
+        turn_context
+            .client
+            .get_model_context_window()
+            .is_some_and(|context_window| input_tokens >= context_window)
+    })
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
@@ -3587,6 +3650,7 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
 struct SamplingRequestToolSelection<'a> {
     explicit_app_paths: &'a [String],
     skill_name_counts_lower: &'a HashMap<String, usize>,
+    allow_preflight_compact: bool,
 }
 
 #[instrument(level = "trace",
@@ -3605,7 +3669,7 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     tool_selection: SamplingRequestToolSelection<'_>,
     cancellation_token: CancellationToken,
-) -> CodexResult<SamplingRequestResult> {
+) -> Result<SamplingRequestResult, SamplingRequestError> {
     let mut mcp_tools = sess
         .services
         .mcp_connection_manager
@@ -3613,7 +3677,9 @@ async fn run_sampling_request(
         .await
         .list_all_tools()
         .or_cancel(&cancellation_token)
-        .await?;
+        .await
+        .map_err(CodexErr::from)
+        .map_err(SamplingRequestError::Codex)?;
     let connectors_for_tools = if turn_context.client.config().features.enabled(Feature::Apps) {
         let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
         Some(filter_connectors_for_input(
@@ -3654,6 +3720,21 @@ async fn run_sampling_request(
         personality: turn_context.personality,
         output_schema: turn_context.final_output_json_schema.clone(),
     };
+    let history_input_tokens = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .map(|tokens| tokens.max(0));
+    let request_input_tokens = turn_context
+        .client
+        .estimated_input_tokens_for_prompt(&prompt)
+        .or(history_input_tokens);
+
+    if tool_selection.allow_preflight_compact
+        && should_preflight_compact(turn_context.as_ref(), request_input_tokens)
+    {
+        return Err(SamplingRequestError::PreflightCompactRequired);
+    }
 
     let mut retries = 0;
     loop {
@@ -3668,25 +3749,27 @@ async fn run_sampling_request(
         )
         .await
         {
-            Ok(output) => {
+            Ok(mut output) => {
+                output.request_input_tokens = request_input_tokens;
                 return Ok(output);
             }
             Err(CodexErr::ContextWindowExceeded) => {
-                sess.set_total_tokens_full(&turn_context).await;
-                return Err(CodexErr::ContextWindowExceeded);
+                return Err(SamplingRequestError::ContextWindowExceeded {
+                    request_input_tokens,
+                });
             }
             Err(CodexErr::UsageLimitReached(e)) => {
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, rate_limits).await;
                 }
-                return Err(CodexErr::UsageLimitReached(e));
+                return Err(SamplingRequestError::Codex(CodexErr::UsageLimitReached(e)));
             }
             Err(err) => err,
         };
 
         if !err.is_retryable() {
-            return Err(err);
+            return Err(SamplingRequestError::Codex(err));
         }
 
         // Use the configured provider-specific stream retry budget.
@@ -3726,15 +3809,24 @@ async fn run_sampling_request(
 
             tokio::time::sleep(delay).await;
         } else {
-            return Err(err);
+            return Err(SamplingRequestError::Codex(err));
         }
     }
+}
+
+#[derive(Debug)]
+enum SamplingRequestError {
+    ContextWindowExceeded { request_input_tokens: Option<i64> },
+    PreflightCompactRequired,
+    Codex(CodexErr),
 }
 
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    request_input_tokens: Option<i64>,
+    tool_output_tokens: i64,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -4116,7 +4208,12 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<i64> {
+    let estimated_before = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .unwrap_or(0);
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
@@ -4128,7 +4225,12 @@ async fn drain_in_flight(
             }
         }
     }
-    Ok(())
+    let estimated_after = sess
+        .clone_history()
+        .await
+        .estimate_token_count(turn_context.as_ref())
+        .unwrap_or(estimated_before);
+    Ok(estimated_after.saturating_sub(estimated_before))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4324,6 +4426,8 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    request_input_tokens: None,
+                    tool_output_tokens: 0,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -4404,7 +4508,8 @@ async fn try_run_sampling_request(
         }
     };
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let tool_output_tokens =
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
         let unified_diff = {
@@ -4417,7 +4522,10 @@ async fn try_run_sampling_request(
         }
     }
 
-    outcome
+    outcome.map(|mut output| {
+        output.tool_output_tokens = tool_output_tokens;
+        output
+    })
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
@@ -4774,6 +4882,110 @@ mod tests {
         expected.extend(session.build_initial_context(&turn_context).await);
         let history = session.state.lock().await.clone_history();
         assert_eq!(expected, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn preflight_compact_uses_dynamic_context_window() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        assert!(turn_context.client.dynamic_context_window().is_some());
+
+        let context_window = turn_context
+            .client
+            .get_model_context_window()
+            .expect("dynamic context window");
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(context_window)
+        ));
+        assert!(!should_preflight_compact(
+            &turn_context,
+            Some(context_window - 1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_context_window_requires_verified_upgrade_before_skipping_preflight_compact() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        let upgradeable_input_tokens = 100_000;
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(upgradeable_input_tokens)
+        ));
+
+        let _ = turn_context
+            .client
+            .maybe_upgrade_dynamic_context_window(upgradeable_input_tokens);
+        assert!(!should_preflight_compact(
+            &turn_context,
+            Some(upgradeable_input_tokens)
+        ));
+
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        let over_limit_input_tokens = 140_000;
+        let _ = turn_context
+            .client
+            .maybe_upgrade_dynamic_context_window(over_limit_input_tokens);
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(over_limit_input_tokens)
+        ));
     }
 
     #[tokio::test]
@@ -5257,6 +5469,8 @@ mod tests {
         let models_manager = Arc::new(ModelsManager::new(
             config.codex_home.clone(),
             auth_manager.clone(),
+            config.model_provider_id.as_str(),
+            config.model_provider.clone(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -5340,6 +5554,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            None,
             conversation_id,
             "turn_id".to_string(),
             services.transport_manager.clone(),
@@ -5377,6 +5592,8 @@ mod tests {
         let models_manager = Arc::new(ModelsManager::new(
             config.codex_home.clone(),
             auth_manager.clone(),
+            config.model_provider_id.as_str(),
+            config.model_provider.clone(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -5460,6 +5677,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            None,
             conversation_id,
             "turn_id".to_string(),
             services.transport_manager.clone(),

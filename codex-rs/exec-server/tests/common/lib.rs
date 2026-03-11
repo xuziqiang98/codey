@@ -1,3 +1,5 @@
+use anyhow::Context;
+use anyhow::ensure;
 use codex_core::MCP_SANDBOX_STATE_METHOD;
 use codex_core::SandboxState;
 use codex_core::protocol::SandboxPolicy;
@@ -19,6 +21,7 @@ use rmcp::transport::ConfigureCommandExt;
 use rmcp::transport::TokioChildProcess;
 use serde_json::json;
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,26 +38,12 @@ where
 {
     let mcp_executable = codex_utils_cargo_bin::cargo_bin("codex-exec-mcp-server")?;
     let execve_wrapper = codex_utils_cargo_bin::cargo_bin("codex-execve-wrapper")?;
-
-    // `bash` is a test resource rather than a binary target, so we must use
-    // `find_resource!` to locate it instead of `cargo_bin()`.
-    let bash = find_resource!("../suite/bash")?;
-
-    // Need to ensure the artifact associated with the bash DotSlash file is
-    // available before it is run in a read-only sandbox.
-    let status = Command::new("dotslash")
-        .arg("--")
-        .arg("fetch")
-        .arg(bash.clone())
-        .env("DOTSLASH_CACHE", dotslash_cache.as_ref())
-        .status()
-        .await?;
-    assert!(status.success(), "dotslash fetch failed: {status:?}");
+    let bash = resolve_bash_for_test(dotslash_cache.as_ref()).await?;
 
     let transport = TokioChildProcess::new(Command::new(&mcp_executable).configure(|cmd| {
         cmd.arg("--bash").arg(bash);
         cmd.arg("--execve").arg(&execve_wrapper);
-        cmd.env("CODEX_HOME", codex_home.as_ref());
+        cmd.env("CODEY_HOME", codex_home.as_ref());
         cmd.env("DOTSLASH_CACHE", dotslash_cache.as_ref());
 
         // Important: pipe stdio so rmcp can speak JSON-RPC over stdin/stdout
@@ -66,6 +55,51 @@ where
     }))?;
 
     Ok(transport)
+}
+
+async fn resolve_bash_for_test(dotslash_cache: &Path) -> anyhow::Result<PathBuf> {
+    // `bash` is a test resource rather than a binary target, so we must use
+    // `find_resource!` to locate it instead of `cargo_bin()`.
+    let bundled_bash = find_resource!("../suite/bash")?;
+
+    // Prefer the bundled Bash when DotSlash is available so tests keep using
+    // the same shell binary as production packaging. Fall back to the system
+    // Bash on leaner environments where `dotslash` is not installed.
+    match Command::new("dotslash")
+        .arg("--")
+        .arg("fetch")
+        .arg(&bundled_bash)
+        .env("DOTSLASH_CACHE", dotslash_cache)
+        .status()
+        .await
+    {
+        Ok(status) => {
+            ensure!(status.success(), "dotslash fetch failed: {status:?}");
+            Ok(bundled_bash.into())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => resolve_system_bash().await,
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn resolve_system_bash() -> anyhow::Result<PathBuf> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("command -v bash")
+        .output()
+        .await
+        .context("failed to resolve system bash")?;
+    ensure!(
+        output.status.success(),
+        "failed to resolve system bash: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bash = String::from_utf8(output.stdout)
+        .context("system bash path was not valid utf8")?
+        .trim()
+        .to_string();
+    ensure!(!bash.is_empty(), "system bash path should not be empty");
+    Ok(PathBuf::from(bash))
 }
 
 pub async fn write_default_execpolicy<P>(policy: &str, codex_home: P) -> anyhow::Result<()>

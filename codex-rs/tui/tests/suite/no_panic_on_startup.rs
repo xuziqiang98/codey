@@ -56,10 +56,10 @@ async fn run_codex_cli(
     codex_home: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
 ) -> anyhow::Result<CodexCliOutput> {
-    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex_cli = codex_utils_cargo_bin::cargo_bin("codey")?;
     let mut env = HashMap::new();
     env.insert(
-        "CODEX_HOME".to_string(),
+        "CODEY_HOME".to_string(),
         codex_home.as_ref().display().to_string(),
     );
 

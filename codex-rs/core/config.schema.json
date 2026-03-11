@@ -92,7 +92,7 @@
       "description": "Determine where Codex should store CLI auth credentials.",
       "oneOf": [
         {
-          "description": "Persist credentials in CODEX_HOME/auth.json.",
+          "description": "Persist credentials in CODEY_HOME/auth.json.",
           "enum": [
             "file"
           ],
@@ -106,7 +106,7 @@
           "type": "string"
         },
         {
-          "description": "Use keyring when available; otherwise, fall back to a file in CODEX_HOME.",
+          "description": "Use keyring when available; otherwise, fall back to a file in CODEY_HOME.",
           "enum": [
             "auto"
           ],
@@ -334,7 +334,7 @@
     },
     "History": {
       "additionalProperties": false,
-      "description": "Settings that govern if and what will be written to `~/.codex/history.jsonl`.",
+      "description": "Settings that govern if and what will be written to `~/.codey/history.jsonl`.",
       "properties": {
         "max_bytes": {
           "description": "If set, the maximum size of the history file in bytes. The oldest entries are dropped once the file exceeds this limit.",
@@ -539,7 +539,7 @@
           "type": "string"
         },
         {
-          "description": "CODEX_HOME/.credentials.json This file will be readable to Codex and other applications running as the same user.",
+          "description": "CODEY_HOME/.credentials.json This file will be readable to Codex and other applications running as the same user.",
           "enum": [
             "file"
           ],
@@ -1106,7 +1106,7 @@
       ]
     }
   },
-  "description": "Base config deserialized from ~/.codex/config.toml.",
+  "description": "Base config deserialized from ~/.codey/config.toml.",
   "properties": {
     "agents": {
       "allOf": [
@@ -1325,7 +1325,7 @@
         }
       ],
       "default": null,
-      "description": "Settings that govern if and what will be written to `~/.codex/history.jsonl`."
+      "description": "Settings that govern if and what will be written to `~/.codey/history.jsonl`."
     },
     "instructions": {
       "description": "System instructions.",

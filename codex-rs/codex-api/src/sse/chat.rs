@@ -6,9 +6,11 @@ use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::Stream;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,6 +21,8 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::trace;
+
+const FINISH_REASON_DRAIN_TIMEOUT_MS: u64 = 50;
 
 pub(crate) fn spawn_chat_stream(
     stream_response: StreamResponse,
@@ -73,12 +77,14 @@ pub async fn process_chat_sse<S>(
     let mut last_tool_call_index: Option<usize> = None;
     let mut assistant_item: Option<ResponseItem> = None;
     let mut reasoning_item: Option<ResponseItem> = None;
-    let mut completed_sent = false;
+    let mut token_usage: Option<TokenUsage> = None;
+    let mut completion_pending = false;
 
     async fn flush_and_complete(
         tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
         reasoning_item: &mut Option<ResponseItem>,
         assistant_item: &mut Option<ResponseItem>,
+        token_usage: &Option<TokenUsage>,
     ) {
         if let Some(reasoning) = reasoning_item.take() {
             let _ = tx_event
@@ -95,30 +101,59 @@ pub async fn process_chat_sse<S>(
         let _ = tx_event
             .send(Ok(ResponseEvent::Completed {
                 response_id: String::new(),
-                token_usage: None,
+                token_usage: token_usage.clone(),
             }))
             .await;
     }
 
     loop {
+        let timeout_duration = if completion_pending {
+            Duration::from_millis(FINISH_REASON_DRAIN_TIMEOUT_MS)
+        } else {
+            idle_timeout
+        };
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let response = timeout(timeout_duration, stream.next()).await;
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
+                if completion_pending {
+                    flush_and_complete(
+                        &tx_event,
+                        &mut reasoning_item,
+                        &mut assistant_item,
+                        &token_usage,
+                    )
+                    .await;
+                    return;
+                }
                 let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
                 return;
             }
             Ok(None) => {
-                if !completed_sent {
-                    flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
-                }
+                flush_and_complete(
+                    &tx_event,
+                    &mut reasoning_item,
+                    &mut assistant_item,
+                    &token_usage,
+                )
+                .await;
                 return;
             }
             Err(_) => {
+                if completion_pending {
+                    flush_and_complete(
+                        &tx_event,
+                        &mut reasoning_item,
+                        &mut assistant_item,
+                        &token_usage,
+                    )
+                    .await;
+                    return;
+                }
                 let _ = tx_event
                     .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
                     .await;
@@ -135,9 +170,13 @@ pub async fn process_chat_sse<S>(
         }
 
         if data == "[DONE]" || data == "DONE" {
-            if !completed_sent {
-                flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
-            }
+            flush_and_complete(
+                &tx_event,
+                &mut reasoning_item,
+                &mut assistant_item,
+                &token_usage,
+            )
+            .await;
             return;
         }
 
@@ -152,10 +191,30 @@ pub async fn process_chat_sse<S>(
             }
         };
 
+        if let Some(parsed_usage) = parse_chat_token_usage(&value) {
+            token_usage = Some(parsed_usage);
+        }
+
+        if completion_pending && token_usage.is_some() {
+            flush_and_complete(
+                &tx_event,
+                &mut reasoning_item,
+                &mut assistant_item,
+                &token_usage,
+            )
+            .await;
+            return;
+        }
+
+        if completion_pending {
+            continue;
+        }
+
         let Some(choices) = value.get("choices").and_then(|c| c.as_array()) else {
             continue;
         };
 
+        let mut saw_terminal_finish_reason = false;
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
                 if let Some(reasoning) = delta.get("reasoning") {
@@ -269,15 +328,12 @@ pub async fn process_chat_sse<S>(
                         .send(Ok(ResponseEvent::OutputItemDone(assistant)))
                         .await;
                 }
-                if !completed_sent {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id: String::new(),
-                            token_usage: None,
-                        }))
-                        .await;
-                    completed_sent = true;
-                }
+                tool_calls.clear();
+                tool_call_order.clear();
+                tool_call_order_seen.clear();
+                tool_call_index_by_id.clear();
+                last_tool_call_index = None;
+                saw_terminal_finish_reason = true;
                 continue;
             }
 
@@ -315,9 +371,59 @@ pub async fn process_chat_sse<S>(
                     };
                     let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }
+
+                tool_call_index_by_id.clear();
+                last_tool_call_index = None;
+
+                if let Some(assistant) = assistant_item.take() {
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(assistant)))
+                        .await;
+                }
+
+                saw_terminal_finish_reason = true;
             }
         }
+
+        if saw_terminal_finish_reason {
+            if token_usage.is_some() {
+                flush_and_complete(
+                    &tx_event,
+                    &mut reasoning_item,
+                    &mut assistant_item,
+                    &token_usage,
+                )
+                .await;
+                return;
+            }
+            completion_pending = true;
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+}
+
+impl From<ChatCompletionUsage> for TokenUsage {
+    fn from(value: ChatCompletionUsage) -> Self {
+        Self {
+            input_tokens: value.prompt_tokens,
+            cached_input_tokens: 0,
+            output_tokens: value.completion_tokens,
+            reasoning_output_tokens: 0,
+            total_tokens: value.total_tokens,
+        }
+    }
+}
+
+fn parse_chat_token_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    serde_json::from_value::<ChatCompletionUsage>(value.get("usage")?.clone())
+        .ok()
+        .map(Into::into)
 }
 
 async fn append_assistant_text(
@@ -386,8 +492,11 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use codex_protocol::models::ResponseItem;
+    use futures::Stream;
     use futures::TryStreamExt;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
     use tokio_util::io::ReaderStream;
 
@@ -412,13 +521,33 @@ mod tests {
     async fn collect_events(body: &str) -> Vec<ResponseEvent> {
         let reader = ReaderStream::new(std::io::Cursor::new(body.to_string()))
             .map_err(|err| codex_client::TransportError::Network(err.to_string()));
+        collect_events_from_stream(reader, Duration::from_millis(1000)).await
+    }
+
+    async fn collect_events_from_open_body(
+        body: &str,
+        idle_timeout: Duration,
+    ) -> Vec<ResponseEvent> {
+        let (mut writer, reader) = tokio::io::duplex(body.len() + 16);
+        let body = body.to_string();
+        tokio::spawn(async move {
+            writer.write_all(body.as_bytes()).await.expect("write body");
+            futures::future::pending::<()>().await;
+        });
+        let reader = ReaderStream::new(reader)
+            .map_err(|err| codex_client::TransportError::Network(err.to_string()));
+        collect_events_from_stream(reader, idle_timeout).await
+    }
+
+    async fn collect_events_from_stream<S>(stream: S, idle_timeout: Duration) -> Vec<ResponseEvent>
+    where
+        S: Stream<Item = Result<bytes::Bytes, codex_client::TransportError>>
+            + Send
+            + Unpin
+            + 'static,
+    {
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
-        tokio::spawn(process_chat_sse(
-            reader,
-            tx,
-            Duration::from_millis(1000),
-            None,
-        ));
+        tokio::spawn(process_chat_sse(stream, tx, idle_timeout, None));
 
         let mut out = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -703,7 +832,7 @@ mod tests {
         });
 
         let body = build_body(&[delta_tool, finish_stop]);
-        let events = collect_events(&body).await;
+        let events = collect_events_from_open_body(&body, Duration::from_millis(200)).await;
 
         assert!(!events.iter().any(|ev| {
             matches!(
@@ -712,5 +841,101 @@ mod tests {
             )
         }));
         assert_matches!(events.last(), Some(ResponseEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn waits_for_usage_chunk_after_stop_finish_reason_without_done() {
+        let delta_content = json!({
+            "choices": [{
+                "delta": {
+                    "content": "hi"
+                }
+            }]
+        });
+
+        let finish_stop = json!({
+            "choices": [{
+                "finish_reason": "stop"
+            }]
+        });
+
+        let usage_only = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 7,
+                "total_tokens": 12
+            }
+        });
+
+        let body = build_body(&[delta_content, finish_stop, usage_only]);
+        let events = collect_events_from_open_body(&body, Duration::from_millis(200)).await;
+
+        assert_matches!(
+            &events[..3],
+            [
+                ResponseEvent::OutputItemAdded(ResponseItem::Message { .. }),
+                ResponseEvent::OutputTextDelta(delta),
+                ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+            ] if delta == "hi"
+        );
+
+        let completed = events.last().expect("completed event");
+        let ResponseEvent::Completed {
+            token_usage: Some(token_usage),
+            ..
+        } = completed
+        else {
+            panic!("expected completed event with token usage");
+        };
+        assert_eq!(
+            token_usage,
+            &TokenUsage {
+                input_tokens: 5,
+                cached_input_tokens: 0,
+                output_tokens: 7,
+                reasoning_output_tokens: 0,
+                total_tokens: 12,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn completes_on_tool_calls_finish_reason_without_done_on_open_stream() {
+        let delta_content_and_tools = json!({
+            "choices": [{
+                "delta": {
+                    "content": [{"text": "hi"}],
+                    "reasoning": "because",
+                    "tool_calls": [{
+                        "id": "call_a",
+                        "function": { "name": "do_a", "arguments": "{}" }
+                    }]
+                }
+            }]
+        });
+
+        let finish = json!({
+            "choices": [{
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let body = build_body(&[delta_content_and_tools, finish]);
+        let events = collect_events_from_open_body(&body, Duration::from_millis(200)).await;
+
+        assert_matches!(
+            &events[..],
+            [
+                ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { .. }),
+                ResponseEvent::ReasoningContentDelta { .. },
+                ResponseEvent::OutputItemAdded(ResponseItem::Message { .. }),
+                ResponseEvent::OutputTextDelta(delta),
+                ResponseEvent::OutputItemDone(ResponseItem::Reasoning { .. }),
+                ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, name, .. }),
+                ResponseEvent::OutputItemDone(ResponseItem::Message { .. }),
+                ResponseEvent::Completed { .. }
+            ] if delta == "hi" && call_id == "call_a" && name == "do_a"
+        );
     }
 }

@@ -18,6 +18,7 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use http::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,11 +55,17 @@ pub struct ModelsManager {
 }
 
 impl ModelsManager {
-    /// Construct a manager scoped to the provided `AuthManager`.
+    /// Construct a manager scoped to the provided `AuthManager` and model provider.
     ///
-    /// Uses `codex_home` to store cached model metadata and initializes with built-in presets.
-    pub fn new(codex_home: PathBuf, auth_manager: Arc<AuthManager>) -> Self {
-        let cache_path = codex_home.join(MODEL_CACHE_FILE);
+    /// Uses `codex_home` to store provider-scoped cached model metadata and initializes with
+    /// built-in presets.
+    pub fn new(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        model_provider_id: &str,
+        provider: ModelProviderInfo,
+    ) -> Self {
+        let cache_path = models_cache_path(&codex_home, model_provider_id);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.get_internal_auth_mode()),
@@ -66,7 +73,7 @@ impl ModelsManager {
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
-            provider: ModelProviderInfo::create_openai_provider(),
+            provider,
         }
     }
 
@@ -88,6 +95,20 @@ impl ModelsManager {
         self.build_available_models(remote_models)
     }
 
+    /// List the models that should be shown in picker UIs.
+    ///
+    /// Includes the current configured model when it is not otherwise visible in
+    /// the picker. Without any configured auth, the picker collapses down to the
+    /// configured model when one is present.
+    pub async fn list_picker_models(
+        &self,
+        config: &Config,
+        refresh_strategy: RefreshStrategy,
+    ) -> Vec<ModelPreset> {
+        let available_models = self.list_models(config, refresh_strategy).await;
+        self.build_picker_models(config, available_models)
+    }
+
     /// List collaboration mode presets.
     ///
     /// Returns a static set of presets seeded with the configured model.
@@ -101,6 +122,15 @@ impl ModelsManager {
     pub fn try_list_models(&self, config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
         let remote_models = self.try_get_remote_models(config)?;
         Ok(self.build_available_models(remote_models))
+    }
+
+    /// Attempt to list picker-visible models without blocking, using cached state.
+    pub fn try_list_picker_models(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<ModelPreset>, TryLockError> {
+        let available_models = self.try_list_models(config)?;
+        Ok(self.build_picker_models(config, available_models))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -293,6 +323,112 @@ impl ModelsManager {
         merged_presets
     }
 
+    fn build_picker_models(
+        &self,
+        config: &Config,
+        available_models: Vec<ModelPreset>,
+    ) -> Vec<ModelPreset> {
+        let mut picker_models: Vec<ModelPreset> = available_models
+            .into_iter()
+            .filter(|preset| preset.show_in_picker)
+            .collect();
+        let has_auth =
+            self.auth_manager.get_internal_auth_mode().is_some() || self.provider.has_local_auth();
+
+        let custom_model = self
+            .configured_picker_model(config, &picker_models)
+            .filter(|preset| {
+                !picker_models
+                    .iter()
+                    .any(|model| model.model == preset.model)
+            });
+
+        match (has_auth, custom_model) {
+            (true, Some(custom_model)) => {
+                picker_models.push(custom_model);
+                picker_models
+            }
+            (true, None) => picker_models,
+            (false, Some(mut custom_model)) => {
+                custom_model.is_default = true;
+                vec![custom_model]
+            }
+            (false, None) => picker_models,
+        }
+    }
+
+    fn configured_picker_model(
+        &self,
+        config: &Config,
+        picker_models: &[ModelPreset],
+    ) -> Option<ModelPreset> {
+        let model = config.model.as_deref()?.trim();
+        if model.is_empty() || picker_models.iter().any(|preset| preset.model == model) {
+            return None;
+        }
+
+        let model_info =
+            model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config);
+        let default_reasoning_effort = config
+            .model_reasoning_effort
+            .or(model_info.default_reasoning_level)
+            .unwrap_or(ReasoningEffort::Medium);
+        let supports_personality = model_info.supports_personality();
+
+        Some(ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: format!(
+                "Configured model from config.toml for provider {}.",
+                config.model_provider_id
+            ),
+            default_reasoning_effort,
+            supported_reasoning_efforts: model_info.supported_reasoning_levels,
+            supports_personality,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+        })
+    }
+
+    pub fn is_configured_custom_model(
+        model: &str,
+        config: &Config,
+        auth_mode: Option<AuthMode>,
+    ) -> bool {
+        let model = model.trim();
+        let Some(config_model) = config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|configured_model| !configured_model.is_empty())
+        else {
+            return false;
+        };
+
+        if config_model != model {
+            return false;
+        }
+
+        let local_presets = builtin_model_presets(auth_mode);
+        let remote_presets: Vec<ModelPreset> = Self::load_remote_models_from_file()
+            .map(|response_models| response_models.into_iter().map(Into::into).collect())
+            .unwrap_or_default();
+        let picker_models = ModelPreset::filter_by_auth(
+            ModelPreset::merge(remote_presets, local_presets),
+            matches!(auth_mode, Some(AuthMode::Chatgpt)),
+        )
+        .into_iter()
+        .filter(|preset| preset.show_in_picker)
+        .collect::<Vec<_>>();
+
+        !picker_models
+            .iter()
+            .any(|preset| preset.model == config_model)
+    }
+
     async fn get_remote_models(&self, config: &Config) -> Vec<ModelInfo> {
         if config.features.enabled(Feature::RemoteModels) {
             self.remote_models.read().await.clone()
@@ -314,18 +450,10 @@ impl ModelsManager {
     pub fn with_provider(
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
+        model_provider_id: &str,
         provider: ModelProviderInfo,
     ) -> Self {
-        let cache_path = codex_home.join(MODEL_CACHE_FILE);
-        let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
-        Self {
-            local_models: builtin_model_presets(auth_manager.get_internal_auth_mode()),
-            remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
-            auth_manager,
-            etag: RwLock::new(None),
-            cache_manager,
-            provider,
-        }
+        Self::new(codex_home, auth_manager, model_provider_id, provider)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -348,6 +476,23 @@ impl ModelsManager {
     pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
         model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config)
     }
+}
+
+fn models_cache_path(codex_home: &std::path::Path, model_provider_id: &str) -> PathBuf {
+    codex_home
+        .join("remote_models")
+        .join(sanitize_model_provider_id(model_provider_id))
+        .join(MODEL_CACHE_FILE)
+}
+
+fn sanitize_model_provider_id(model_provider_id: &str) -> String {
+    model_provider_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '_',
+        })
+        .collect()
 }
 
 /// Convert a client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3")
@@ -442,6 +587,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_sorts_by_priority() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let remote_models = vec![
             remote_model("priority-low", "Low", 1),
@@ -465,8 +612,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -498,7 +649,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_uses_supplied_provider_for_remote_model_refresh() {
+        core_test_support::skip_if_sandbox!();
+
+        let server = MockServer::start().await;
+        let remote_models = vec![remote_model("custom-provider-model", "Custom Provider", 1)];
+        let models_mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: remote_models.clone(),
+            },
+        )
+        .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.features.enable(Feature::RemoteModels);
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = provider_for(server.uri());
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "custom-provider",
+            provider,
+        );
+
+        manager
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("refresh succeeds");
+        assert_models_contain(&manager.get_remote_models(&config).await, &remote_models);
+        assert_eq!(
+            models_mock.requests().len(),
+            1,
+            "expected a single /models request against the supplied provider"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_available_models_uses_cache_when_fresh() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let remote_models = vec![remote_model("cached", "Cached", 5)];
         let models_mock = mount_models_once(
@@ -522,8 +718,12 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -545,7 +745,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_available_models_scopes_cache_by_provider() {
+        core_test_support::skip_if_sandbox!();
+
+        let server_a = MockServer::start().await;
+        let models_a = vec![remote_model("provider-a", "Provider A", 1)];
+        let mock_a = mount_models_once(
+            &server_a,
+            ModelsResponse {
+                models: models_a.clone(),
+            },
+        )
+        .await;
+
+        let server_b = MockServer::start().await;
+        let models_b = vec![remote_model("provider-b", "Provider B", 1)];
+        let mock_b = mount_models_once(
+            &server_b,
+            ModelsResponse {
+                models: models_b.clone(),
+            },
+        )
+        .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.features.enable(Feature::RemoteModels);
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+
+        let manager_a = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            Arc::clone(&auth_manager),
+            "mock-provider-a",
+            provider_for(server_a.uri()),
+        );
+        manager_a
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("provider A refresh succeeds");
+        assert_models_contain(&manager_a.get_remote_models(&config).await, &models_a);
+
+        let manager_b = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider-b",
+            provider_for(server_b.uri()),
+        );
+        manager_b
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("provider B refresh succeeds");
+
+        let remote_models = manager_b.get_remote_models(&config).await;
+        assert_models_contain(&remote_models, &models_b);
+        assert!(
+            !remote_models.iter().any(|model| model.slug == "provider-a"),
+            "provider B should not reuse provider A cache"
+        );
+        assert_eq!(
+            mock_a.requests().len(),
+            1,
+            "provider A should fetch /models once"
+        );
+        assert_eq!(
+            mock_b.requests().len(),
+            1,
+            "provider B should fetch /models once instead of reusing provider A cache"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_available_models_refetches_when_cache_stale() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let initial_models = vec![remote_model("stale", "Stale", 1)];
         let initial_mock = mount_models_once(
@@ -569,8 +849,12 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -615,6 +899,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_drops_removed_remote_models() {
+        core_test_support::skip_if_sandbox!();
+
         let server = MockServer::start().await;
         let initial_models = vec![remote_model("remote-old", "Remote Old", 1)];
         let initial_mock = mount_models_once(
@@ -635,8 +921,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
-        let mut manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
         manager.cache_manager.set_ttl(Duration::ZERO);
 
         manager
@@ -688,8 +978,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let provider = provider_for("http://example.test".to_string());
-        let mut manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
         manager.local_models = Vec::new();
 
         let hidden_model = remote_model_with_visibility("hidden", "Hidden", 0, "hide");
@@ -723,5 +1017,201 @@ mod tests {
             !response.models.is_empty(),
             "bundled models.json should contain at least one model"
         );
+    }
+
+    #[test]
+    fn models_cache_path_sanitizes_provider_id() {
+        let path = models_cache_path(std::path::Path::new("/tmp/codey"), "mock/provider:beta");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/codey/remote_models/mock_provider_beta/models_cache.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_without_auth_returns_only_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
+        assert_eq!(picker_models[0].display_name, "mock-model");
+        assert_eq!(
+            picker_models[0].description,
+            "Configured model from config.toml for provider mock-provider."
+        );
+        assert!(picker_models[0].is_default);
+        assert!(picker_models[0].show_in_picker);
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_auth_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+        assert_eq!(
+            picker_models
+                .iter()
+                .filter(|preset| preset.is_default)
+                .count(),
+            1
+        );
+        assert!(
+            picker_models
+                .iter()
+                .any(|preset| preset.model == "gpt-5.2-codex" && preset.is_default)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_provider_bearer_token_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = provider_for("http://example.test".to_string());
+        provider.experimental_bearer_token = Some("sk-test".to_string());
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_provider_env_key_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = provider_for("http://example.test".to_string());
+        provider.env_key = Some("PATH".to_string());
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_custom_model_detection_matches_picker_behavior() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+
+        config.model = Some("mock-model".to_string());
+        assert!(ModelsManager::is_configured_custom_model(
+            "mock-model",
+            &config,
+            auth_manager.get_internal_auth_mode(),
+        ));
+
+        config.model = Some("gpt-5.2-codex".to_string());
+        assert!(!ModelsManager::is_configured_custom_model(
+            "gpt-5.2-codex",
+            &config,
+            auth_manager.get_internal_auth_mode(),
+        ));
     }
 }

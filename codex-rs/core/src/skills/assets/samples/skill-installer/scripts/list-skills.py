@@ -32,7 +32,7 @@ def _request(url: str) -> bytes:
 
 
 def _codex_home() -> str:
-    return os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    return os.environ.get("CODEY_HOME", os.path.expanduser("~/.codey"))
 
 
 def _installed_skills() -> set[str]:

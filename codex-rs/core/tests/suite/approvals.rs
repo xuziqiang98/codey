@@ -1684,6 +1684,8 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
 #[tokio::test(flavor = "current_thread")]
 #[cfg(unix)]
 async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts() -> Result<()> {
+    core_test_support::skip_if_sandbox!(Ok(()));
+
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
     let sandbox_policy = SandboxPolicy::ReadOnly;

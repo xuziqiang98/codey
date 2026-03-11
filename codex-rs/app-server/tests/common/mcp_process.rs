@@ -96,7 +96,7 @@ impl McpProcess {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.env("CODEX_HOME", codex_home);
+        cmd.env("CODEY_HOME", codex_home);
         cmd.env("RUST_LOG", "debug");
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
 

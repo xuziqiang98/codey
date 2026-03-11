@@ -65,11 +65,11 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(author = "Codex", version, about = "Bootstrap Codex app-server", long_about = None)]
 struct Cli {
-    /// Path to the `codex` CLI binary.
-    #[arg(long, env = "CODEX_BIN", default_value = "codex")]
+    /// Path to the `codey` CLI binary.
+    #[arg(long, env = "CODEX_BIN", default_value = "codey")]
     codex_bin: String,
 
-    /// Forwarded to the `codex` CLI as `--config key=value`. Repeatable.
+    /// Forwarded to the `codey` CLI as `--config key=value`. Repeatable.
     ///
     /// Example:
     ///   `--config 'model_providers.mock.base_url="http://localhost:4010/v2"'`

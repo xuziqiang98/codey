@@ -34,8 +34,12 @@ const USE_LOGIN_SHELL: bool = false;
 /// command should be run privileged outside the sandbox.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_elicitation_for_prompt_rule() -> Result<()> {
+    if !command_exists("dotslash").await? {
+        return Ok(());
+    }
+
     // Configure a stdio transport that will launch the MCP server using
-    // $CODEX_HOME with an execpolicy that prompts for `git init` commands.
+    // $CODEY_HOME with an execpolicy that prompts for `git init` commands.
     let codex_home = TempDir::new()?;
     write_default_execpolicy(
         r#"
@@ -79,8 +83,8 @@ prefix_rule(
     let linux_sandbox_exe_folder = TempDir::new()?;
     let codex_linux_sandbox_exe = if cfg!(target_os = "linux") {
         let codex_linux_sandbox_exe = linux_sandbox_exe_folder.path().join("codex-linux-sandbox");
-        let codex_cli = ensure_codex_cli()?;
-        symlink(&codex_cli, &codex_linux_sandbox_exe)?;
+        let codex_exec = ensure_codex_exec()?;
+        symlink(&codex_exec, &codex_linux_sandbox_exe)?;
         Some(codex_linux_sandbox_exe)
     } else {
         None
@@ -143,29 +147,29 @@ prefix_rule(
     Ok(())
 }
 
-fn ensure_codex_cli() -> Result<PathBuf> {
-    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
+fn ensure_codex_exec() -> Result<PathBuf> {
+    let codex_exec = codex_utils_cargo_bin::cargo_bin("codex-exec")?;
 
-    let metadata = codex_cli.metadata().with_context(|| {
+    let metadata = codex_exec.metadata().with_context(|| {
         format!(
-            "failed to read metadata for codex binary at {}",
-            codex_cli.display()
+            "failed to read metadata for codex-exec binary at {}",
+            codex_exec.display()
         )
     })?;
     ensure!(
         metadata.is_file(),
-        "expected codex binary at {} to be a file; run `cargo build -p codex-cli --bin codex` before this test",
-        codex_cli.display()
+        "expected codex-exec binary at {} to be a file; run `cargo build -p codex-exec --bin codex-exec` before this test",
+        codex_exec.display()
     );
 
     let mode = metadata.permissions().mode();
     ensure!(
         mode & 0o111 != 0,
-        "codex binary at {} is not executable (mode {mode:o}); run `cargo build -p codex-cli --bin codex` before this test",
-        codex_cli.display()
+        "codex-exec binary at {} is not executable (mode {mode:o}); run `cargo build -p codex-exec --bin codex-exec` before this test",
+        codex_exec.display()
     );
 
-    Ok(codex_cli)
+    Ok(codex_exec)
 }
 
 async fn resolve_git_path(use_login_shell: bool) -> Result<String> {
@@ -187,4 +191,14 @@ async fn resolve_git_path(use_login_shell: bool) -> Result<String> {
         .to_string();
     ensure!(!git_path.is_empty(), "git path should not be empty");
     Ok(git_path)
+}
+
+async fn command_exists(command: &str) -> Result<bool> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .output()
+        .await
+        .with_context(|| format!("failed to check whether `{command}` is installed"))?;
+    Ok(output.status.success())
 }
