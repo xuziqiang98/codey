@@ -55,11 +55,17 @@ pub struct ModelsManager {
 }
 
 impl ModelsManager {
-    /// Construct a manager scoped to the provided `AuthManager`.
+    /// Construct a manager scoped to the provided `AuthManager` and model provider.
     ///
-    /// Uses `codex_home` to store cached model metadata and initializes with built-in presets.
-    pub fn new(codex_home: PathBuf, auth_manager: Arc<AuthManager>) -> Self {
-        let cache_path = codex_home.join(MODEL_CACHE_FILE);
+    /// Uses `codex_home` to store provider-scoped cached model metadata and initializes with
+    /// built-in presets.
+    pub fn new(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        model_provider_id: &str,
+        provider: ModelProviderInfo,
+    ) -> Self {
+        let cache_path = models_cache_path(&codex_home, model_provider_id);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.get_internal_auth_mode()),
@@ -67,7 +73,7 @@ impl ModelsManager {
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
-            provider: ModelProviderInfo::create_openai_provider(),
+            provider,
         }
     }
 
@@ -443,18 +449,10 @@ impl ModelsManager {
     pub fn with_provider(
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
+        model_provider_id: &str,
         provider: ModelProviderInfo,
     ) -> Self {
-        let cache_path = codex_home.join(MODEL_CACHE_FILE);
-        let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
-        Self {
-            local_models: builtin_model_presets(auth_manager.get_internal_auth_mode()),
-            remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
-            auth_manager,
-            etag: RwLock::new(None),
-            cache_manager,
-            provider,
-        }
+        Self::new(codex_home, auth_manager, model_provider_id, provider)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -477,6 +475,23 @@ impl ModelsManager {
     pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
         model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config)
     }
+}
+
+fn models_cache_path(codex_home: &std::path::Path, model_provider_id: &str) -> PathBuf {
+    codex_home
+        .join("remote_models")
+        .join(sanitize_model_provider_id(model_provider_id))
+        .join(MODEL_CACHE_FILE)
+}
+
+fn sanitize_model_provider_id(model_provider_id: &str) -> String {
+    model_provider_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '_',
+        })
+        .collect()
 }
 
 /// Convert a client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3")
@@ -596,8 +611,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -629,6 +648,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_uses_supplied_provider_for_remote_model_refresh() {
+        core_test_support::skip_if_sandbox!();
+
+        let server = MockServer::start().await;
+        let remote_models = vec![remote_model("custom-provider-model", "Custom Provider", 1)];
+        let models_mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: remote_models.clone(),
+            },
+        )
+        .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.features.enable(Feature::RemoteModels);
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = provider_for(server.uri());
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "custom-provider",
+            provider,
+        );
+
+        manager
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("refresh succeeds");
+        assert_models_contain(&manager.get_remote_models(&config).await, &remote_models);
+        assert_eq!(
+            models_mock.requests().len(),
+            1,
+            "expected a single /models request against the supplied provider"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_available_models_uses_cache_when_fresh() {
         core_test_support::skip_if_sandbox!();
 
@@ -655,8 +717,12 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -674,6 +740,84 @@ mod tests {
             models_mock.requests().len(),
             1,
             "cache hit should avoid a second /models request"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_available_models_scopes_cache_by_provider() {
+        core_test_support::skip_if_sandbox!();
+
+        let server_a = MockServer::start().await;
+        let models_a = vec![remote_model("provider-a", "Provider A", 1)];
+        let mock_a = mount_models_once(
+            &server_a,
+            ModelsResponse {
+                models: models_a.clone(),
+            },
+        )
+        .await;
+
+        let server_b = MockServer::start().await;
+        let models_b = vec![remote_model("provider-b", "Provider B", 1)];
+        let mock_b = mount_models_once(
+            &server_b,
+            ModelsResponse {
+                models: models_b.clone(),
+            },
+        )
+        .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.features.enable(Feature::RemoteModels);
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+
+        let manager_a = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            Arc::clone(&auth_manager),
+            "mock-provider-a",
+            provider_for(server_a.uri()),
+        );
+        manager_a
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("provider A refresh succeeds");
+        assert_models_contain(&manager_a.get_remote_models(&config).await, &models_a);
+
+        let manager_b = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider-b",
+            provider_for(server_b.uri()),
+        );
+        manager_b
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("provider B refresh succeeds");
+
+        let remote_models = manager_b.get_remote_models(&config).await;
+        assert_models_contain(&remote_models, &models_b);
+        assert!(
+            !remote_models.iter().any(|model| model.slug == "provider-a"),
+            "provider B should not reuse provider A cache"
+        );
+        assert_eq!(
+            mock_a.requests().len(),
+            1,
+            "provider A should fetch /models once"
+        );
+        assert_eq!(
+            mock_b.requests().len(),
+            1,
+            "provider B should fetch /models once instead of reusing provider A cache"
         );
     }
 
@@ -704,8 +848,12 @@ mod tests {
             AuthCredentialsStoreMode::File,
         ));
         let provider = provider_for(server.uri());
-        let manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -772,8 +920,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
-        let mut manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
         manager.cache_manager.set_ttl(Duration::ZERO);
 
         manager
@@ -825,8 +977,12 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let provider = provider_for("http://example.test".to_string());
-        let mut manager =
-            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
         manager.local_models = Vec::new();
 
         let hidden_model = remote_model_with_visibility("hidden", "Hidden", 0, "hide");
@@ -862,6 +1018,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn models_cache_path_sanitizes_provider_id() {
+        let path = models_cache_path(std::path::Path::new("/tmp/codey"), "mock/provider:beta");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/codey/remote_models/mock_provider_beta/models_cache.json")
+        );
+    }
+
     #[tokio::test]
     async fn list_picker_models_without_auth_returns_only_configured_custom_model() {
         let codex_home = tempdir().expect("temp dir");
@@ -870,7 +1035,12 @@ mod tests {
             false,
             AuthCredentialsStoreMode::File,
         ));
-        let manager = ModelsManager::new(codex_home.path().to_path_buf(), auth_manager);
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
         let mut config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
@@ -899,7 +1069,12 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-        let manager = ModelsManager::new(codex_home.path().to_path_buf(), auth_manager);
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
         let mut config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()

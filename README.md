@@ -8,6 +8,8 @@
 ### Building
 ```
 cd codex-rs && cargo build -p codex-cli --bin codey
+
+export PATH="<codey binary path>:$PATH" >> ~/.bashrc
 ```
 
 ## Docs

@@ -2696,7 +2696,7 @@ async fn unknown_chat_model_upgrades_context_window_after_large_success() {
         .await;
 
     let model_provider = unknown_chat_model_provider(&server);
-    let large_input = "a".repeat(140_000);
+    let large_input = "a".repeat(100_000);
 
     let codex = test_codex()
         .with_config(move |config| {

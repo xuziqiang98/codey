@@ -172,6 +172,7 @@ impl TestCodexBuilder {
         let auth = self.auth.clone();
         let thread_manager = ThreadManager::with_models_provider_and_home(
             auth.clone(),
+            config.model_provider_id.as_str(),
             config.model_provider.clone(),
             config.codex_home.clone(),
         );

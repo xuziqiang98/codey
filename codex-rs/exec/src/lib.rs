@@ -345,6 +345,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let thread_manager = Arc::new(ThreadManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),
+        config.model_provider_id.as_str(),
+        config.model_provider.clone(),
         SessionSource::Exec,
     ));
     let default_model = thread_manager

@@ -4923,6 +4923,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_context_window_requires_verified_upgrade_before_skipping_preflight_compact() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        let upgradeable_input_tokens = 100_000;
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(upgradeable_input_tokens)
+        ));
+
+        let _ = turn_context
+            .client
+            .maybe_upgrade_dynamic_context_window(upgradeable_input_tokens);
+        assert!(!should_preflight_compact(
+            &turn_context,
+            Some(upgradeable_input_tokens)
+        ));
+
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        let over_limit_input_tokens = 140_000;
+        let _ = turn_context
+            .client
+            .maybe_upgrade_dynamic_context_window(over_limit_input_tokens);
+        assert!(should_preflight_compact(
+            &turn_context,
+            Some(over_limit_input_tokens)
+        ));
+    }
+
+    #[tokio::test]
     async fn thread_rollback_drops_last_turn_from_history() {
         let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
@@ -5403,6 +5469,8 @@ mod tests {
         let models_manager = Arc::new(ModelsManager::new(
             config.codex_home.clone(),
             auth_manager.clone(),
+            config.model_provider_id.as_str(),
+            config.model_provider.clone(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -5524,6 +5592,8 @@ mod tests {
         let models_manager = Arc::new(ModelsManager::new(
             config.codex_home.clone(),
             auth_manager.clone(),
+            config.model_provider_id.as_str(),
+            config.model_provider.clone(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();

@@ -41,8 +41,18 @@ impl DynamicContextWindowState {
         CONTEXT_WINDOW_STEPS[self.current_step_index]
     }
 
-    pub(crate) fn maybe_upgrade(&mut self, input_tokens: i64) -> Option<i64> {
-        let current = self.current_context_window();
+    fn effective_context_window(&self, effective_context_window_percent: i64) -> i64 {
+        self.current_context_window()
+            .saturating_mul(effective_context_window_percent)
+            / 100
+    }
+
+    pub(crate) fn maybe_upgrade(
+        &mut self,
+        input_tokens: i64,
+        effective_context_window_percent: i64,
+    ) -> Option<i64> {
+        let current = self.effective_context_window(effective_context_window_percent);
         if input_tokens <= current || self.current_step_index + 1 >= CONTEXT_WINDOW_STEPS.len() {
             return None;
         }
@@ -51,8 +61,13 @@ impl DynamicContextWindowState {
         Some(self.current_context_window())
     }
 
-    pub(crate) fn record_compact_retry(&mut self, turn_id: &str, input_tokens: i64) -> bool {
-        let current = self.current_context_window();
+    pub(crate) fn record_compact_retry(
+        &mut self,
+        turn_id: &str,
+        input_tokens: i64,
+        effective_context_window_percent: i64,
+    ) -> bool {
+        let current = self.effective_context_window(effective_context_window_percent);
         if input_tokens <= current {
             return false;
         }
@@ -76,25 +91,26 @@ mod tests {
         let mut state = DynamicContextWindowState::new();
 
         assert_eq!(state.current_context_window(), 32_000);
-        assert_eq!(state.maybe_upgrade(32_000), None);
-        assert_eq!(state.maybe_upgrade(32_001), Some(128_000));
+        assert_eq!(state.maybe_upgrade(30_400, 95), None);
+        assert_eq!(state.maybe_upgrade(30_401, 95), Some(128_000));
         assert_eq!(state.current_context_window(), 128_000);
-        assert_eq!(state.maybe_upgrade(128_001), Some(200_000));
+        assert_eq!(state.maybe_upgrade(121_600, 95), None);
+        assert_eq!(state.maybe_upgrade(121_601, 95), Some(200_000));
         assert_eq!(state.current_context_window(), 200_000);
-        assert_eq!(state.maybe_upgrade(200_001), None);
+        assert_eq!(state.maybe_upgrade(190_001, 95), None);
     }
 
     #[test]
     fn compact_retry_is_limited_per_turn_and_step() {
         let mut state = DynamicContextWindowState::new();
 
-        assert!(state.record_compact_retry("turn-1", 40_000));
-        assert!(!state.record_compact_retry("turn-1", 40_000));
+        assert!(state.record_compact_retry("turn-1", 40_000, 95));
+        assert!(!state.record_compact_retry("turn-1", 40_000, 95));
 
-        assert_eq!(state.maybe_upgrade(40_000), Some(128_000));
-        assert!(state.record_compact_retry("turn-1", 140_000));
-        assert!(!state.record_compact_retry("turn-1", 140_000));
+        assert_eq!(state.maybe_upgrade(40_000, 95), Some(128_000));
+        assert!(state.record_compact_retry("turn-1", 140_000, 95));
+        assert!(!state.record_compact_retry("turn-1", 140_000, 95));
 
-        assert!(state.record_compact_retry("turn-2", 140_000));
+        assert!(state.record_compact_retry("turn-2", 140_000, 95));
     }
 }

@@ -257,6 +257,8 @@ impl ModelClient {
     }
 
     pub(crate) fn maybe_upgrade_dynamic_context_window(&self, input_tokens: i64) -> Option<i64> {
+        let effective_context_window_percent =
+            self.state.model_info.effective_context_window_percent;
         self.state
             .dynamic_context_window
             .as_ref()
@@ -264,7 +266,7 @@ impl ModelClient {
                 window
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .maybe_upgrade(input_tokens)
+                    .maybe_upgrade(input_tokens, effective_context_window_percent)
             })
     }
 
@@ -273,6 +275,8 @@ impl ModelClient {
         turn_id: &str,
         input_tokens: i64,
     ) -> bool {
+        let effective_context_window_percent =
+            self.state.model_info.effective_context_window_percent;
         self.state
             .dynamic_context_window
             .as_ref()
@@ -280,7 +284,7 @@ impl ModelClient {
                 window
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record_compact_retry(turn_id, input_tokens)
+                    .record_compact_retry(turn_id, input_tokens, effective_context_window_percent)
             })
     }
 
