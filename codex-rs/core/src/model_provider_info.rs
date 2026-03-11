@@ -204,6 +204,17 @@ impl ModelProviderInfo {
         }
     }
 
+    pub(crate) fn has_local_auth(&self) -> bool {
+        self.experimental_bearer_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+            || self
+                .env_key
+                .as_deref()
+                .and_then(|env_key| std::env::var(env_key).ok())
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+
     /// Effective maximum number of request retries for this provider.
     pub fn request_max_retries(&self) -> u64 {
         self.request_max_retries

@@ -332,7 +332,8 @@ impl ModelsManager {
             .into_iter()
             .filter(|preset| preset.show_in_picker)
             .collect();
-        let has_auth = self.auth_manager.get_internal_auth_mode().is_some();
+        let has_auth =
+            self.auth_manager.get_internal_auth_mode().is_some() || self.provider.has_local_auth();
 
         let custom_model = self
             .configured_picker_model(config, &picker_models)
@@ -1106,6 +1107,82 @@ mod tests {
             picker_models
                 .iter()
                 .any(|preset| preset.model == "gpt-5.2-codex" && preset.is_default)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_provider_bearer_token_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = provider_for("http://example.test".to_string());
+        provider.experimental_bearer_token = Some("sk-test".to_string());
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_picker_models_with_provider_env_key_appends_configured_custom_model() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = provider_for("http://example.test".to_string());
+        provider.env_key = Some("PATH".to_string());
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider,
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
         );
     }
 
