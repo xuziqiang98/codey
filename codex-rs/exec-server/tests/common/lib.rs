@@ -75,7 +75,7 @@ async fn resolve_bash_for_test(dotslash_cache: &Path) -> anyhow::Result<PathBuf>
     {
         Ok(status) => {
             ensure!(status.success(), "dotslash fetch failed: {status:?}");
-            Ok(bundled_bash.into())
+            Ok(bundled_bash)
         }
         Err(err) if err.kind() == ErrorKind::NotFound => resolve_system_bash().await,
         Err(err) => Err(err.into()),

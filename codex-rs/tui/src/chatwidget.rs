@@ -33,7 +33,9 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
+use codex_core::config::ConfigToml;
 use codex_core::config::ConstraintResult;
+use codex_core::config::profile::ConfigProfile;
 use codex_core::config::types::Notifications;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
@@ -156,6 +158,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::bottom_pane::provider_config_view::ProviderConfigView;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::collab;
 use crate::collaboration_modes;
@@ -174,6 +177,7 @@ use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::markdown::append_markdown;
+use crate::provider_config::generated_profile_prefix;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::FlexRenderable;
@@ -210,6 +214,7 @@ use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
 
@@ -2834,6 +2839,9 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Providers => {
+                self.open_provider_popup();
+            }
             SlashCommand::Personality => {
                 self.open_personality_popup();
             }
@@ -3863,7 +3871,16 @@ impl ChatWidget {
                     return;
                 }
             };
-        self.open_model_popup_with_presets(presets);
+        self.open_model_popup_with_presets(self.merge_saved_provider_model_presets(presets));
+    }
+
+    pub(crate) fn open_provider_popup(&mut self) {
+        self.bottom_pane.show_view(Box::new(ProviderConfigView::new(
+            self.config.codex_home.clone(),
+            self.app_event_tx.clone(),
+            self.frame_requester.clone(),
+        )));
+        self.request_redraw();
     }
 
     pub(crate) fn open_personality_popup(&mut self) {
@@ -4053,6 +4070,69 @@ impl ChatWidget {
             header,
             ..Default::default()
         });
+    }
+
+    fn merge_saved_provider_model_presets(
+        &self,
+        mut presets: Vec<ModelPreset>,
+    ) -> Vec<ModelPreset> {
+        let prefix = generated_profile_prefix(self.config.model_provider_id.as_str());
+        let mut known_models: HashSet<String> =
+            presets.iter().map(|preset| preset.model.clone()).collect();
+        let configured_profiles = self.configured_profiles();
+
+        let mut saved_models: Vec<ModelPreset> = configured_profiles
+            .iter()
+            .filter(|(name, profile)| {
+                name.starts_with(&prefix)
+                    && profile.model_provider.as_deref()
+                        == Some(self.config.model_provider_id.as_str())
+            })
+            .filter_map(|(_, profile)| profile.model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .filter(|model| known_models.insert((*model).to_string()))
+            .map(|model| self.saved_provider_model_preset(model))
+            .collect();
+
+        presets.append(&mut saved_models);
+        presets
+    }
+
+    fn saved_provider_model_preset(&self, model: &str) -> ModelPreset {
+        let default_reasoning_effort = self
+            .config
+            .model_reasoning_effort
+            .unwrap_or(ReasoningEffortConfig::Medium);
+
+        ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: format!(
+                "Saved model from config.toml for provider {}.",
+                self.config.model_provider_id
+            ),
+            default_reasoning_effort,
+            supported_reasoning_efforts: vec![ReasoningEffortPreset {
+                effort: default_reasoning_effort,
+                description: "Saved locally".to_string(),
+            }],
+            supports_personality: false,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+        }
+    }
+
+    fn configured_profiles(&self) -> HashMap<String, ConfigProfile> {
+        self.config
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .map(|config: ConfigToml| config.profiles)
+            .unwrap_or_default()
     }
 
     fn is_auto_model(model: &str) -> bool {
@@ -5187,6 +5267,20 @@ impl ChatWidget {
     /// Set the personality in the widget's config copy.
     pub(crate) fn set_personality(&mut self, personality: Personality) {
         self.config.personality = Some(personality);
+    }
+
+    pub(crate) fn sync_provider_config(&mut self, config: &Config, update_active_provider: bool) {
+        self.config.config_layer_stack = config.config_layer_stack.clone();
+        self.config.model_providers = config.model_providers.clone();
+        if update_active_provider {
+            self.config.model_provider = config.model_provider.clone();
+        }
+        self.request_redraw();
+    }
+
+    pub(crate) fn dismiss_active_view(&mut self) {
+        self.bottom_pane.dismiss_active_view();
+        self.request_redraw();
     }
 
     /// Set the model in the widget's config copy and stored collaboration mode.

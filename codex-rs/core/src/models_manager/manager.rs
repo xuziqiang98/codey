@@ -22,6 +22,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use http::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
@@ -51,7 +52,7 @@ pub struct ModelsManager {
     auth_manager: Arc<AuthManager>,
     etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
-    provider: ModelProviderInfo,
+    provider: StdRwLock<ModelProviderInfo>,
 }
 
 impl ModelsManager {
@@ -73,8 +74,15 @@ impl ModelsManager {
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
-            provider,
+            provider: StdRwLock::new(provider),
         }
+    }
+
+    pub fn set_provider(&self, provider: ModelProviderInfo) {
+        *self
+            .provider
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
     }
 
     /// List all available models, refreshing according to the specified strategy.
@@ -235,8 +243,9 @@ impl ModelsManager {
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth_manager.auth().await;
         let auth_mode = self.auth_manager.get_internal_auth_mode();
-        let api_provider = self.provider.to_api_provider(auth_mode)?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+        let provider = self.provider_snapshot();
+        let api_provider = provider.to_api_provider(auth_mode)?;
+        let api_auth = auth_provider_from_auth(auth.clone(), &provider)?;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let client = ModelsClient::new(transport, api_provider, api_auth);
 
@@ -332,8 +341,8 @@ impl ModelsManager {
             .into_iter()
             .filter(|preset| preset.show_in_picker)
             .collect();
-        let has_auth =
-            self.auth_manager.get_internal_auth_mode().is_some() || self.provider.has_local_auth();
+        let has_auth = self.auth_manager.get_internal_auth_mode().is_some()
+            || self.provider_snapshot().has_local_auth();
 
         let custom_model = self
             .configured_picker_model(config, &picker_models)
@@ -443,6 +452,13 @@ impl ModelsManager {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    fn provider_snapshot(&self) -> ModelProviderInfo {
+        self.provider
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1176,6 +1192,51 @@ mod tests {
             .list_picker_models(&config, RefreshStrategy::Offline)
             .await;
 
+        assert_eq!(
+            picker_models.first().map(|preset| preset.model.as_str()),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            picker_models.last().map(|preset| preset.model.as_str()),
+            Some("mock-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_provider_updates_picker_auth_state() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let manager = ModelsManager::with_provider(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "mock-provider",
+            provider_for("http://example.test".to_string()),
+        );
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.model = Some("mock-model".to_string());
+        config.model_provider_id = "mock-provider".to_string();
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
+
+        let mut updated_provider = provider_for("http://example.test/v2".to_string());
+        updated_provider.experimental_bearer_token = Some("sk-test".to_string());
+        manager.set_provider(updated_provider);
+
+        let picker_models = manager
+            .list_picker_models(&config, RefreshStrategy::Offline)
+            .await;
         assert_eq!(
             picker_models.first().map(|preset| preset.model.as_str()),
             Some("gpt-5.2-codex")

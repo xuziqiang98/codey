@@ -429,6 +429,10 @@ impl Codex {
         state.session_configuration.thread_config_snapshot()
     }
 
+    pub(crate) async fn update_model_provider(&self, provider: ModelProviderInfo) {
+        self.session.update_model_provider(provider).await;
+    }
+
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.session.state_db()
     }
@@ -559,6 +563,17 @@ impl SessionConfiguration {
         }
     }
 
+    fn update_model_provider(&mut self, provider: ModelProviderInfo) {
+        self.provider = provider.clone();
+
+        let mut config = (*self.original_config_do_not_use).clone();
+        config.model_provider = provider.clone();
+        config
+            .model_providers
+            .insert(config.model_provider_id.clone(), provider);
+        self.original_config_do_not_use = Arc::new(config);
+    }
+
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
@@ -604,6 +619,11 @@ impl Session {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
+        per_turn_config.model_provider = session_configuration.provider.clone();
+        per_turn_config.model_providers.insert(
+            per_turn_config.model_provider_id.clone(),
+            session_configuration.provider.clone(),
+        );
         per_turn_config.model_reasoning_effort =
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
@@ -638,6 +658,16 @@ impl Session {
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
+    }
+
+    pub(crate) async fn update_model_provider(&self, provider: ModelProviderInfo) {
+        {
+            let mut state = self.state.lock().await;
+            state
+                .session_configuration
+                .update_model_provider(provider.clone());
+        }
+        self.services.models_manager.set_provider(provider);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5700,6 +5730,32 @@ mod tests {
 
     fn mark_state_initial_context_seeded(state: &mut SessionState) {
         state.initial_context_seeded = true;
+    }
+
+    #[tokio::test]
+    async fn update_model_provider_refreshes_session_and_new_turns() {
+        let (session, turn_context) = make_session_and_context().await;
+        let mut provider = turn_context.client.get_provider();
+        provider.base_url = Some("https://example.com/v2".to_string());
+        provider.experimental_bearer_token = Some("sk-updated".to_string());
+        provider.wire_api = crate::WireApi::Chat;
+
+        session.update_model_provider(provider.clone()).await;
+
+        let config = session.get_config().await;
+        assert_eq!(config.model_provider, provider);
+        assert_eq!(
+            config
+                .model_providers
+                .get(config.model_provider_id.as_str()),
+            Some(&provider)
+        );
+
+        let turn_context = session
+            .new_default_turn_with_sub_id("updated-provider".to_string())
+            .await;
+        assert_eq!(turn_context.client.get_provider(), provider);
+        assert_eq!(turn_context.client.config().model_provider, provider);
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
+use crate::provider_config::CustomProviderConfig;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
@@ -643,6 +644,80 @@ impl App {
             self.suppress_shutdown_complete = true;
             self.chat_widget.submit_op(Op::Shutdown);
             self.server.remove_thread(&thread_id).await;
+        }
+    }
+
+    async fn reload_runtime_provider_config(
+        &mut self,
+        provider_id: &str,
+        is_active_provider: bool,
+    ) -> std::result::Result<(), String> {
+        let mut reloaded = self
+            .rebuild_config_for_cwd(self.config.cwd.clone())
+            .await
+            .map_err(|err| err.to_string())?;
+        self.apply_runtime_policy_overrides(&mut reloaded);
+
+        let provider = reloaded
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!("saved provider `{provider_id}` was not found after reloading config")
+            })?;
+
+        self.config.config_layer_stack = reloaded.config_layer_stack.clone();
+        self.config.model_providers = reloaded.model_providers.clone();
+        if is_active_provider {
+            self.config.model_provider = provider.clone();
+        }
+        self.chat_widget
+            .sync_provider_config(&self.config, is_active_provider);
+
+        if is_active_provider {
+            self.server
+                .get_models_manager()
+                .set_provider(provider.clone());
+            if let Some(thread_id) = self.chat_widget.thread_id()
+                && let Ok(thread) = self.server.get_thread(thread_id).await
+            {
+                thread.update_model_provider(provider).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_custom_provider_configured(&mut self, config: CustomProviderConfig) {
+        let provider_id = config.provider_id.clone();
+        let model = config.model.clone();
+        let is_active_provider = provider_id == self.config.model_provider_id;
+
+        self.chat_widget.dismiss_active_view();
+
+        match self
+            .reload_runtime_provider_config(&provider_id, is_active_provider)
+            .await
+        {
+            Ok(()) => {
+                let hint = if is_active_provider {
+                    Some(
+                        "Updated this session's provider settings. Use /model to switch to the saved model."
+                            .to_string(),
+                    )
+                } else {
+                    Some("Restart Codex to start a session with this provider.".to_string())
+                };
+                self.chat_widget.add_info_message(
+                    format!("Saved provider `{provider_id}` with model `{model}`."),
+                    hint,
+                );
+            }
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Saved provider `{provider_id}` with model `{model}`, but failed to refresh runtime config: {err}. Restart Codex to use the updated settings."
+                ));
+            }
         }
     }
 
@@ -1568,6 +1643,9 @@ impl App {
             }
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
+            }
+            AppEvent::CustomProviderConfigured(config) => {
+                self.handle_custom_provider_configured(config).await;
             }
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
@@ -2505,11 +2583,17 @@ mod tests {
     use crate::history_cell::HistoryCell;
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
+    use crate::provider_config::ApiProviderWireApi;
+    use crate::provider_config::CustomProviderConfig;
+    use crate::provider_config::build_custom_provider_edits;
+    use crate::provider_config::generated_profile_name;
     use codex_core::AuthManager;
     use codex_core::CodexAuth;
     use codex_core::ThreadManager;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
+    use codex_core::config::ConfigToml;
+    use codex_core::config::edit::ConfigEditsBuilder;
     use codex_core::models_manager::manager::ModelsManager;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
@@ -3082,6 +3166,132 @@ mod tests {
         assert_eq!(
             summary.resume_command,
             Some("codey resume my-session".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_provider_save_refreshes_active_provider_from_reloaded_config() {
+        let mut app = make_test_app().await;
+        let config_path = app.config.codex_home.join("config.toml");
+        let saved = CustomProviderConfig {
+            provider_id: "custom_1".to_string(),
+            wire_api: ApiProviderWireApi::Chat,
+            base_url: "https://example.com/chat".to_string(),
+            api_key: "sk-new".to_string(),
+            model: "gpt-other".to_string(),
+        };
+        std::fs::write(
+            &config_path,
+            r#"model_provider = "custom_1"
+model = "gpt-test"
+
+[model_providers.custom_1]
+name = "custom_1"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-old"
+env_key = "CUSTOM_API_KEY"
+
+[model_providers.custom_1.query_params]
+api-version = "2025-04-01-preview"
+
+[model_providers.custom_1.http_headers]
+X-Test = "1"
+"#,
+        )
+        .expect("write config");
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits(build_custom_provider_edits(&saved))
+            .apply()
+            .await
+            .expect("persist provider save");
+
+        app.config = ConfigBuilder::default()
+            .codex_home(app.config.codex_home.clone())
+            .build()
+            .await
+            .expect("reload config");
+        app.chat_widget.sync_provider_config(&app.config, true);
+
+        app.handle_custom_provider_configured(saved).await;
+
+        assert_eq!(
+            app.config.model_provider.env_key.as_deref(),
+            Some("CUSTOM_API_KEY")
+        );
+        assert_eq!(
+            app.config
+                .model_provider
+                .query_params
+                .as_ref()
+                .and_then(|params| params.get("api-version"))
+                .map(String::as_str),
+            Some("2025-04-01-preview")
+        );
+        assert_eq!(
+            app.config
+                .model_provider
+                .http_headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-Test"))
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().model_provider,
+            app.config.model_provider
+        );
+
+        let config_toml: ConfigToml = app
+            .config
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .expect("config toml");
+        assert_eq!(
+            config_toml
+                .profiles
+                .get(generated_profile_name("custom_1", "gpt-other").as_str())
+                .and_then(|profile| profile.model.as_deref()),
+            Some("gpt-other")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_provider_save_keeps_runtime_provider_for_inactive_provider() {
+        let mut app = make_test_app().await;
+        let saved = CustomProviderConfig {
+            provider_id: "custom_1".to_string(),
+            wire_api: ApiProviderWireApi::Responses,
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-test".to_string(),
+        };
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits(build_custom_provider_edits(&saved))
+            .apply()
+            .await
+            .expect("persist provider save");
+        let original_provider_id = app.config.model_provider_id.clone();
+        let original_provider = app.config.model_provider.clone();
+
+        app.handle_custom_provider_configured(saved).await;
+
+        assert_eq!(app.config.model_provider_id, original_provider_id);
+        assert_eq!(app.config.model_provider, original_provider);
+
+        let config_toml: ConfigToml = app
+            .config
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .expect("config toml");
+        assert_eq!(
+            config_toml
+                .profiles
+                .get(generated_profile_name("custom_1", "gpt-test").as_str())
+                .and_then(|profile| profile.model_provider.as_deref()),
+            Some("custom_1")
         );
     }
 }
