@@ -149,6 +149,7 @@ use codex_core::auth::login_with_chatgpt_auth_tokens;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::ConfigService;
+use codex_core::config::ConfigToml;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::types::McpServerTransportConfig;
@@ -1387,19 +1388,61 @@ impl CodexMessageProcessor {
     async fn set_default_model(&self, request_id: RequestId, params: SetDefaultModelParams) {
         let SetDefaultModelParams {
             model,
+            model_provider,
             reasoning_effort,
         } = params;
 
-        match ConfigEditsBuilder::new(&self.config.codex_home)
-            .with_profile(self.config.active_profile.as_deref())
-            .set_model(model.as_deref(), reasoning_effort)
-            .apply()
-            .await
-        {
-            Ok(()) => {
-                let response = SetDefaultModelResponse {};
-                self.outgoing.send_response(request_id, response).await;
+        let resolved_model_provider = match (model_provider, model.as_deref()) {
+            (Some(model_provider), _) => {
+                if self.config.model_providers.contains_key(&model_provider) {
+                    Ok(Some(model_provider))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "model provider `{model_provider}` was not found"
+                    ))
+                }
             }
+            (None, Some(model)) => self
+                .config
+                .config_layer_stack
+                .effective_config()
+                .try_into()
+                .map_err(anyhow::Error::from)
+                .and_then(|config_toml: ConfigToml| {
+                    config_toml
+                        .resolve_model_provider_for_model(model)
+                        .map_err(anyhow::Error::from)
+                })
+                .map(|model_provider| {
+                    Some(model_provider.unwrap_or_else(|| self.config.model_provider_id.clone()))
+                }),
+            (None, None) => Ok(None),
+        };
+
+        match resolved_model_provider {
+            Ok(resolved_model_provider) => match ConfigEditsBuilder::new(&self.config.codex_home)
+                .with_profile(self.config.active_profile.as_deref())
+                .set_model(
+                    model.as_deref(),
+                    reasoning_effort,
+                    resolved_model_provider.as_deref(),
+                )
+                .apply()
+                .await
+            {
+                Ok(()) => {
+                    let response = SetDefaultModelResponse {};
+                    self.outgoing.send_response(request_id, response).await;
+                }
+                Err(err) => {
+                    let error = JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to persist model selection: {err}"),
+                        data: None,
+                    };
+                    self.outgoing.send_error(request_id, error).await;
+                }
+            },
             Err(err) => {
                 let error = JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,

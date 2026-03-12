@@ -63,6 +63,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use similar::DiffableStr;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -1014,6 +1015,34 @@ impl From<ConfigToml> for UserSavedConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveModelProviderError {
+    model: String,
+    provider_ids: Vec<String>,
+}
+
+impl ResolveModelProviderError {
+    fn ambiguous(model: &str, provider_ids: BTreeSet<String>) -> Self {
+        Self {
+            model: model.to_string(),
+            provider_ids: provider_ids.into_iter().collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveModelProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model `{}` is configured for multiple providers: {}",
+            self.model,
+            self.provider_ids.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ResolveModelProviderError {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ProjectConfig {
@@ -1175,6 +1204,49 @@ impl ConfigToml {
                 ))
             }
             None => Ok(ConfigProfile::default()),
+        }
+    }
+
+    pub fn resolve_model_provider_for_model(
+        &self,
+        model: &str,
+    ) -> Result<Option<String>, ResolveModelProviderError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Ok(None);
+        }
+
+        let mut provider_ids = BTreeSet::new();
+
+        if self.model.as_deref().map(str::trim) == Some(model)
+            && let Some(provider_id) = self
+                .model_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider_id| !provider_id.is_empty())
+        {
+            provider_ids.insert(provider_id.to_string());
+        }
+
+        for profile in self.profiles.values() {
+            if profile.model.as_deref().map(str::trim) != Some(model) {
+                continue;
+            }
+
+            if let Some(provider_id) = profile
+                .model_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider_id| !provider_id.is_empty())
+            {
+                provider_ids.insert(provider_id.to_string());
+            }
+        }
+
+        match provider_ids.len() {
+            0 => Ok(None),
+            1 => Ok(provider_ids.into_iter().next()),
+            _ => Err(ResolveModelProviderError::ambiguous(model, provider_ids)),
         }
     }
 }
@@ -3443,7 +3515,7 @@ url = "https://example.com/mcp"
         let codex_home = TempDir::new()?;
 
         ConfigEditsBuilder::new(codex_home.path())
-            .set_model(Some("gpt-5.1-codex"), Some(ReasoningEffort::High))
+            .set_model(Some("gpt-5.1-codex"), Some(ReasoningEffort::High), None)
             .apply()
             .await?;
 
@@ -3475,7 +3547,7 @@ model = "gpt-4.1"
         .await?;
 
         ConfigEditsBuilder::new(codex_home.path())
-            .set_model(Some("o4-mini"), Some(ReasoningEffort::High))
+            .set_model(Some("o4-mini"), Some(ReasoningEffort::High), None)
             .apply()
             .await?;
 
@@ -3501,7 +3573,7 @@ model = "gpt-4.1"
 
         ConfigEditsBuilder::new(codex_home.path())
             .with_profile(Some("dev"))
-            .set_model(Some("gpt-5.1-codex"), Some(ReasoningEffort::Medium))
+            .set_model(Some("gpt-5.1-codex"), Some(ReasoningEffort::Medium), None)
             .apply()
             .await?;
 
@@ -3542,7 +3614,7 @@ model = "gpt-5.1-codex"
 
         ConfigEditsBuilder::new(codex_home.path())
             .with_profile(Some("dev"))
-            .set_model(Some("o4-high"), Some(ReasoningEffort::Medium))
+            .set_model(Some("o4-high"), Some(ReasoningEffort::Medium), None)
             .apply()
             .await?;
 
@@ -3568,6 +3640,73 @@ model = "gpt-5.1-codex"
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn resolve_model_provider_for_model_uses_unique_profile_mapping() {
+        let config_toml: ConfigToml = toml::from_str(
+            r#"
+model = "glm-5"
+model_provider = "chatanywhere"
+
+[profiles.deepseek]
+model = "deepseek-v3"
+model_provider = "iie"
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            config_toml
+                .resolve_model_provider_for_model("deepseek-v3")
+                .expect("resolve provider"),
+            Some("iie".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_for_model_returns_none_when_unmapped() {
+        let config_toml: ConfigToml = toml::from_str(
+            r#"
+model = "glm-5"
+model_provider = "chatanywhere"
+
+[profiles.deepseek]
+model = "deepseek-v3"
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            config_toml
+                .resolve_model_provider_for_model("claude-3.7")
+                .expect("resolve provider"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_for_model_rejects_ambiguous_mapping() {
+        let config_toml: ConfigToml = toml::from_str(
+            r#"
+[profiles.first]
+model = "deepseek-v3"
+model_provider = "iie"
+
+[profiles.second]
+model = "deepseek-v3"
+model_provider = "chatanywhere"
+"#,
+        )
+        .expect("parse config");
+
+        let err = config_toml
+            .resolve_model_provider_for_model("deepseek-v3")
+            .expect_err("expected ambiguous provider mapping");
+        assert_eq!(
+            err.to_string(),
+            "model `deepseek-v3` is configured for multiple providers: chatanywhere, iie"
+        );
     }
 
     struct PrecedenceTestFixture {

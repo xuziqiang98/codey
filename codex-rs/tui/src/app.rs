@@ -37,10 +37,12 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::ModelProviderInfo;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::ConfigToml;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config_loader::ConfigLayerStackOrdering;
@@ -476,8 +478,6 @@ async fn handle_model_migration_prompt_if_needed(
 
                 config.model = Some(target_model.clone());
                 config.model_reasoning_effort = mapped_effort;
-                app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
-                app_event_tx.send(AppEvent::UpdateReasoningEffort(mapped_effort));
                 app_event_tx.send(AppEvent::PersistModelSelection {
                     model: target_model.clone(),
                     effort: mapped_effort,
@@ -666,6 +666,49 @@ impl App {
                 format!("saved provider `{provider_id}` was not found after reloading config")
             })?;
 
+        self.config.config_layer_stack = reloaded.config_layer_stack.clone();
+        self.config.model_providers = reloaded.model_providers.clone();
+        self.activate_runtime_provider(provider_id, provider, model)
+            .await;
+
+        Ok(())
+    }
+
+    fn resolve_model_provider_for_model(&self, model: &str) -> std::result::Result<String, String> {
+        let config_toml: ConfigToml = self
+            .config
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .map_err(|err| format!("Failed to load config for model selection: {err}"))?;
+
+        config_toml
+            .resolve_model_provider_for_model(model)
+            .map(|provider_id| provider_id.unwrap_or_else(|| self.config.model_provider_id.clone()))
+            .map_err(|err| err.to_string())
+    }
+
+    fn runtime_provider_for_id(
+        &self,
+        provider_id: &str,
+    ) -> std::result::Result<ModelProviderInfo, String> {
+        if provider_id == self.config.model_provider_id {
+            return Ok(self.config.model_provider.clone());
+        }
+
+        self.config
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| format!("model provider `{provider_id}` was not found"))
+    }
+
+    async fn activate_runtime_provider(
+        &mut self,
+        provider_id: &str,
+        provider: ModelProviderInfo,
+        model: &str,
+    ) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             match self.server.get_thread(thread_id).await {
                 Ok(thread) => {
@@ -691,15 +734,71 @@ impl App {
                 .await;
         }
 
-        self.config.config_layer_stack = reloaded.config_layer_stack.clone();
-        self.config.model_providers = reloaded.model_providers.clone();
         self.config.model_provider_id = provider_id.to_string();
         self.config.model_provider = provider;
         self.config.model = Some(model.to_string());
         self.chat_widget.sync_provider_config(&self.config, true);
         self.chat_widget.set_model(model);
+    }
 
-        Ok(())
+    fn apply_model_selection_to_runtime(
+        &mut self,
+        model: &str,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        self.chat_widget.submit_op(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some(model.to_string()),
+            effort: Some(effort),
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        });
+        self.chat_widget.set_model(model);
+        self.on_update_reasoning_effort(effort);
+    }
+
+    async fn persist_model_selection(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> std::result::Result<String, String> {
+        let profile = self.active_profile.clone();
+        let provider_id = self.resolve_model_provider_for_model(&model)?;
+        let provider = self.runtime_provider_for_id(&provider_id)?;
+
+        self.activate_runtime_provider(&provider_id, provider, &model)
+            .await;
+        self.apply_model_selection_to_runtime(&model, effort);
+
+        if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_profile(profile.as_deref())
+            .set_model(Some(model.as_str()), effort, Some(provider_id.as_str()))
+            .apply()
+            .await
+        {
+            let prefix = match profile.as_deref() {
+                Some(profile) => format!("Failed to save model for profile `{profile}`: {err}"),
+                None => format!("Failed to save default model: {err}"),
+            };
+            return Err(format!(
+                "{prefix}. Switched the current session to model `{model}` using provider `{provider_id}`."
+            ));
+        }
+
+        self.reload_runtime_provider_config(&provider_id, &model)
+            .await
+            .map_err(|err| {
+                format!(
+                    "Saved model `{model}` with provider `{provider_id}`, but failed to activate it in this session: {err}. Restart Codex to use the updated settings."
+                )
+            })?;
+        self.apply_model_selection_to_runtime(&model, effort);
+
+        Ok(provider_id)
     }
 
     async fn handle_custom_provider_configured(&mut self, config: CustomProviderConfig) {
@@ -1913,39 +2012,30 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_model(Some(model.as_str()), effort)
-                    .apply()
-                    .await
-                {
-                    Ok(()) => {
+                let previous_provider_id = self.config.model_provider_id.clone();
+                let profile = self.active_profile.clone();
+                match self.persist_model_selection(model.clone(), effort).await {
+                    Ok(provider_id) => {
                         let mut message = format!("Model changed to {model}");
                         if let Some(label) = Self::reasoning_label_for(&model, effort) {
                             message.push(' ');
                             message.push_str(label);
                         }
+                        if provider_id != previous_provider_id {
+                            message.push_str(" using provider `");
+                            message.push_str(&provider_id);
+                            message.push('`');
+                        }
                         if let Some(profile) = profile {
                             message.push_str(" for ");
-                            message.push_str(profile);
+                            message.push_str(&profile);
                             message.push_str(" profile");
                         }
                         self.chat_widget.add_info_message(message, None);
                     }
                     Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            "failed to persist model selection"
-                        );
-                        if let Some(profile) = profile {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save model for profile `{profile}`: {err}"
-                            ));
-                        } else {
-                            self.chat_widget
-                                .add_error_message(format!("Failed to save default model: {err}"));
-                        }
+                        tracing::error!(error = %err, "failed to persist model selection");
+                        self.chat_widget.add_error_message(err);
                     }
                 }
             }
@@ -3222,6 +3312,7 @@ X-Test = "1"
             .await
             .expect("reload config");
         app.chat_widget.sync_provider_config(&app.config, true);
+        app.chat_widget.set_model("model-a");
 
         app.handle_custom_provider_configured(saved).await;
 
@@ -3353,5 +3444,184 @@ X-Test = "1"
         let snapshot = thread.config_snapshot().await;
         assert_eq!(snapshot.model_provider_id, "custom_1");
         assert_eq!(snapshot.model, "gpt-test");
+    }
+
+    #[tokio::test]
+    async fn persist_model_selection_switches_runtime_provider_from_saved_profile_mapping() {
+        let mut app = make_test_app().await;
+        let config_path = app.config.codex_home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "model-a"
+model_provider = "provider_a"
+
+[model_providers.provider_a]
+name = "provider_a"
+base_url = "https://example.com/a"
+wire_api = "chat"
+experimental_bearer_token = "sk-a"
+
+[model_providers.provider_b]
+name = "provider_b"
+base_url = "https://example.com/b"
+wire_api = "chat"
+experimental_bearer_token = "sk-b"
+
+[profiles.saved]
+model = "model-b"
+model_provider = "provider_b"
+"#,
+        )
+        .expect("write config");
+
+        app.config = ConfigBuilder::default()
+            .codex_home(app.config.codex_home.clone())
+            .build()
+            .await
+            .expect("reload config");
+        app.chat_widget.sync_provider_config(&app.config, true);
+        app.chat_widget.set_model("model-a");
+
+        let provider_id = app
+            .persist_model_selection("model-b".to_string(), Some(ReasoningEffortConfig::High))
+            .await
+            .expect("persist model selection");
+
+        assert_eq!(provider_id, "provider_b");
+        assert_eq!(app.config.model_provider_id, "provider_b");
+        assert_eq!(app.config.model.as_deref(), Some("model-b"));
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(app.chat_widget.current_model(), "model-b");
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::High)
+        );
+
+        let config_toml: ConfigToml = app
+            .config
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .expect("config toml");
+        assert_eq!(config_toml.model.as_deref(), Some("model-b"));
+        assert_eq!(config_toml.model_provider.as_deref(), Some("provider_b"));
+    }
+
+    #[tokio::test]
+    async fn persist_model_selection_rejects_ambiguous_provider_mapping() {
+        let mut app = make_test_app().await;
+        let config_path = app.config.codex_home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "model-a"
+model_provider = "provider_a"
+
+[model_providers.provider_a]
+name = "provider_a"
+base_url = "https://example.com/a"
+wire_api = "chat"
+experimental_bearer_token = "sk-a"
+
+[model_providers.provider_b]
+name = "provider_b"
+base_url = "https://example.com/b"
+wire_api = "chat"
+experimental_bearer_token = "sk-b"
+
+[profiles.first]
+model = "shared-model"
+model_provider = "provider_a"
+
+[profiles.second]
+model = "shared-model"
+model_provider = "provider_b"
+"#,
+        )
+        .expect("write config");
+
+        app.config = ConfigBuilder::default()
+            .codex_home(app.config.codex_home.clone())
+            .build()
+            .await
+            .expect("reload config");
+        app.chat_widget.sync_provider_config(&app.config, true);
+        app.chat_widget.set_model("model-a");
+
+        let err = app
+            .persist_model_selection("shared-model".to_string(), None)
+            .await
+            .expect_err("expected ambiguous model selection to fail");
+
+        assert_eq!(
+            err,
+            "model `shared-model` is configured for multiple providers: provider_a, provider_b"
+        );
+        assert_eq!(app.config.model_provider_id, "provider_a");
+        assert_eq!(app.config.model.as_deref(), Some("model-a"));
+        assert_eq!(app.chat_widget.current_model(), "model-a");
+    }
+
+    #[tokio::test]
+    async fn persist_model_selection_switches_runtime_when_save_fails() {
+        let mut app = make_test_app().await;
+        let config_path = app.config.codex_home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "model-a"
+model_provider = "provider_a"
+
+[model_providers.provider_a]
+name = "provider_a"
+base_url = "https://example.com/a"
+wire_api = "chat"
+experimental_bearer_token = "sk-a"
+
+[model_providers.provider_b]
+name = "provider_b"
+base_url = "https://example.com/b"
+wire_api = "chat"
+experimental_bearer_token = "sk-b"
+
+[profiles.saved]
+model = "model-b"
+model_provider = "provider_b"
+"#,
+        )
+        .expect("write config");
+
+        app.config = ConfigBuilder::default()
+            .codex_home(app.config.codex_home.clone())
+            .build()
+            .await
+            .expect("reload config");
+        app.chat_widget.sync_provider_config(&app.config, true);
+        app.chat_widget.set_model("model-a");
+        app.config.codex_home = config_path;
+
+        let err = app
+            .persist_model_selection("model-b".to_string(), Some(ReasoningEffortConfig::High))
+            .await
+            .expect_err("expected model persistence to fail");
+
+        assert!(
+            err.contains(
+                "Switched the current session to model `model-b` using provider `provider_b`."
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(app.config.model_provider_id, "provider_b");
+        assert_eq!(app.config.model.as_deref(), Some("model-b"));
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(app.chat_widget.current_model(), "model-b");
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::High)
+        );
     }
 }

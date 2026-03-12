@@ -3493,10 +3493,13 @@ async fn single_reasoning_option_skips_selection() {
     }
 
     assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
-        "expected reasoning effort to be applied automatically; events: {events:?}"
+        events.iter().any(|ev| matches!(
+            ev,
+            AppEvent::PersistModelSelection { model, effort }
+                if model == "model-with-single-reasoning"
+                    && *effort == Some(ReasoningEffortConfig::High)
+        )),
+        "expected single reasoning option to persist model selection automatically; events: {events:?}"
     );
 }
 

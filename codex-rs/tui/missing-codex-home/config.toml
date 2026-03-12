@@ -1,0 +1,3 @@
+model = "model-b"
+model_reasoning_effort = "high"
+model_provider = "provider_b"

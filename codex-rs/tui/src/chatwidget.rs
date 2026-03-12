@@ -4180,19 +4180,6 @@ impl ChatWidget {
             let effort_label = effort_for_action
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "default".to_string());
-            tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: Some(model_for_action.clone()),
-                effort: Some(effort_for_action),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-            }));
-            tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort_for_action));
             tx.send(AppEvent::PersistModelSelection {
                 model: model_for_action.clone(),
                 effort: effort_for_action,
@@ -4353,21 +4340,6 @@ impl ChatWidget {
     }
 
     fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
-        self.app_event_tx
-            .send(AppEvent::CodexOp(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: Some(model.clone()),
-                effort: Some(effort),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-            }));
-        self.app_event_tx.send(AppEvent::UpdateModel(model.clone()));
-        self.app_event_tx
-            .send(AppEvent::UpdateReasoningEffort(effort));
         self.app_event_tx.send(AppEvent::PersistModelSelection {
             model: model.clone(),
             effort,
