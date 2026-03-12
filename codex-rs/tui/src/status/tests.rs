@@ -1256,7 +1256,64 @@ async fn status_context_window_uses_last_usage() {
         "expected context line to reflect last usage tokens, got: {context_line}"
     );
     assert!(
+        context_line.contains("94% left"),
+        "expected context line to show real remaining percentage, got: {context_line}"
+    );
+    assert!(
         !context_line.contains("102K"),
         "context line should not use total aggregated tokens, got: {context_line}"
+    );
+}
+
+#[tokio::test]
+async fn status_context_window_percent_matches_used_and_window() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model_context_window = Some(30_400);
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage {
+        total_tokens: 10_600,
+        ..TokenUsage::default()
+    };
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 1, 12, 0, 0)
+        .single()
+        .expect("timestamp");
+
+    let model_slug = ModelsManager::get_model_offline(config.model.as_deref());
+    let token_info = TokenUsageInfo {
+        total_token_usage: usage.clone(),
+        last_token_usage: usage,
+        model_context_window: config.model_context_window,
+    };
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &TokenUsage::default(),
+        &None,
+        None,
+        None,
+        None,
+        None,
+        now,
+        &model_slug,
+        None,
+        None,
+    );
+    let rendered_lines = render_lines(&composite.display_lines(80));
+    let context_line = rendered_lines
+        .into_iter()
+        .find(|line| line.contains("Context window"))
+        .expect("context line");
+
+    assert!(
+        context_line.contains("65% left"),
+        "expected context line to show real remaining percentage, got: {context_line}"
+    );
+    assert!(
+        context_line.contains("10.6K used / 30.4K"),
+        "expected context line to keep used/window display aligned, got: {context_line}"
     );
 }

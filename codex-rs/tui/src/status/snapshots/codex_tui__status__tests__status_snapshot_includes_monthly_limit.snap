@@ -18,6 +18,6 @@ expression: sanitized
 │  Agents.md:        <none>                                                  │
 │  Account:          user@example.com (Unknown)                              │
 │                                                                            │
-│  Context window:   100% left (1.2K used / 272K)                            │
+│  Context window:   99% left (1.2K used / 272K)                             │
 │  Monthly limit:    [██████████████████░░] 88% left (resets 07:08 on 7 May) │
 ╰────────────────────────────────────────────────────────────────────────────╯

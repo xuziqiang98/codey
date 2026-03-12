@@ -1232,9 +1232,6 @@ pub struct CreditsSnapshot {
     pub balance: Option<String>,
 }
 
-// Includes prompts, tools and space to call compact.
-const BASELINE_TOKENS: i64 = 12000;
-
 impl TokenUsage {
     pub fn is_zero(&self) -> bool {
         self.total_tokens == 0
@@ -1257,27 +1254,20 @@ impl TokenUsage {
         self.total_tokens
     }
 
-    /// Estimate the remaining user-controllable percentage of the model's context window.
+    /// Estimate the remaining percentage of the current context window.
     ///
-    /// `context_window` is the total size of the model's context window.
-    /// `BASELINE_TOKENS` should capture tokens that are always present in
-    /// the context (e.g., system prompt and fixed tool instructions) so that
-    /// the percentage reflects the portion the user can influence.
-    ///
-    /// This normalizes both the numerator and denominator by subtracting the
-    /// baseline, so immediately after the first prompt the UI shows 100% left
-    /// and trends toward 0% as the user fills the effective window.
+    /// `context_window` is the current effective size of the model's context
+    /// window after any runtime adjustments. The returned percentage uses the
+    /// same window and token count shown elsewhere in the UI so the percentage
+    /// matches the displayed `used / window` values.
     pub fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
-        if context_window <= BASELINE_TOKENS {
+        if context_window <= 0 {
             return 0;
         }
 
-        let effective_window = context_window - BASELINE_TOKENS;
-        let used = (self.tokens_in_context_window() - BASELINE_TOKENS).max(0);
-        let remaining = (effective_window - used).max(0);
-        ((remaining as f64 / effective_window as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as i64
+        let used = self.tokens_in_context_window().max(0);
+        let remaining = context_window.saturating_sub(used);
+        (remaining.saturating_mul(100) / context_window).clamp(0, 100)
     }
 
     /// In-place element-wise sum of token counts.
@@ -2697,5 +2687,31 @@ mod tests {
         assert_eq!(value["msg"]["failed"][0]["error"], "bad");
         assert_eq!(value["msg"]["cancelled"][0], "c");
         Ok(())
+    }
+
+    #[test]
+    fn context_window_percent_uses_real_remaining_capacity() {
+        let usage = TokenUsage {
+            total_tokens: 10_600,
+            ..TokenUsage::default()
+        };
+
+        assert_eq!(usage.percent_of_context_window_remaining(30_400), 65);
+    }
+
+    #[test]
+    fn context_window_percent_floors_and_clamps() {
+        let low_usage = TokenUsage {
+            total_tokens: 1,
+            ..TokenUsage::default()
+        };
+        assert_eq!(low_usage.percent_of_context_window_remaining(100), 99);
+
+        let overfull_usage = TokenUsage {
+            total_tokens: 250,
+            ..TokenUsage::default()
+        };
+        assert_eq!(overfull_usage.percent_of_context_window_remaining(100), 0);
+        assert_eq!(overfull_usage.percent_of_context_window_remaining(0), 0);
     }
 }
