@@ -3501,6 +3501,48 @@ async fn single_reasoning_option_skips_selection() {
 }
 
 #[tokio::test]
+async fn model_picker_with_no_reasoning_options_dismisses_after_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let preset = ModelPreset {
+        id: "custom-model".to_string(),
+        model: "custom-model".to_string(),
+        display_name: "custom-model".to_string(),
+        description: "Configured model from config.toml.".to_string(),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: Vec::new(),
+        supports_personality: false,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    };
+    chat.open_all_models_popup(vec![preset]);
+
+    let before = render_bottom_popup(&chat, 80);
+    assert!(
+        before.contains("Select Model and Effort"),
+        "expected model picker to be open; popup: {before}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let after = render_bottom_popup(&chat, 80);
+    assert!(
+        !after.contains("Select Model and Effort"),
+        "expected model picker to dismiss after selecting a model with no reasoning options; popup: {after}"
+    );
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, AppEvent::OpenReasoningPopup { model } if model.model == "custom-model")),
+        "expected custom model selection to continue through the reasoning handler; events: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn feedback_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
