@@ -433,6 +433,17 @@ impl Codex {
         self.session.update_model_provider(provider).await;
     }
 
+    pub(crate) async fn switch_provider_and_model(
+        &self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        self.session
+            .switch_provider_and_model(model_provider_id, provider, model)
+            .await;
+    }
+
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.session.state_db()
     }
@@ -574,6 +585,25 @@ impl SessionConfiguration {
         self.original_config_do_not_use = Arc::new(config);
     }
 
+    fn switch_provider_and_model(
+        &mut self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        self.provider = provider.clone();
+        self.collaboration_mode =
+            self.collaboration_mode
+                .with_updates(Some(model.clone()), None, None);
+
+        let mut config = (*self.original_config_do_not_use).clone();
+        config.model_provider_id = model_provider_id.clone();
+        config.model_provider = provider.clone();
+        config.model = Some(model);
+        config.model_providers.insert(model_provider_id, provider);
+        self.original_config_do_not_use = Arc::new(config);
+    }
+
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
@@ -668,6 +698,26 @@ impl Session {
                 .update_model_provider(provider.clone());
         }
         self.services.models_manager.set_provider(provider);
+    }
+
+    pub(crate) async fn switch_provider_and_model(
+        &self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            state.session_configuration.switch_provider_and_model(
+                model_provider_id.clone(),
+                provider.clone(),
+                model,
+            );
+        }
+        self.services
+            .models_manager
+            .switch_provider(model_provider_id.as_str(), provider)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5756,6 +5806,54 @@ mod tests {
             .await;
         assert_eq!(turn_context.client.get_provider(), provider);
         assert_eq!(turn_context.client.config().model_provider, provider);
+    }
+
+    #[tokio::test]
+    async fn switch_provider_and_model_refreshes_session_and_new_turns() {
+        let (session, turn_context) = make_session_and_context().await;
+        let mut provider = turn_context.client.get_provider();
+        provider.base_url = Some("https://example.com/v2".to_string());
+        provider.experimental_bearer_token = Some("sk-updated".to_string());
+        provider.wire_api = crate::WireApi::Chat;
+
+        session
+            .switch_provider_and_model(
+                "custom-provider".to_string(),
+                provider.clone(),
+                "custom-model".to_string(),
+            )
+            .await;
+
+        let config = session.get_config().await;
+        assert_eq!(config.model_provider_id, "custom-provider");
+        assert_eq!(config.model_provider, provider);
+        assert_eq!(config.model.as_deref(), Some("custom-model"));
+        assert_eq!(
+            config
+                .model_providers
+                .get(config.model_provider_id.as_str()),
+            Some(&config.model_provider)
+        );
+
+        let snapshot = {
+            let state = session.state.lock().await;
+            state.session_configuration.thread_config_snapshot()
+        };
+        assert_eq!(snapshot.model_provider_id, "custom-provider");
+        assert_eq!(snapshot.model, "custom-model");
+
+        let turn_context = session
+            .new_default_turn_with_sub_id("updated-provider-and-model".to_string())
+            .await;
+        assert_eq!(turn_context.client.get_provider(), provider);
+        assert_eq!(
+            turn_context.client.config().model_provider_id,
+            "custom-provider"
+        );
+        assert_eq!(
+            turn_context.client.config().model.as_deref(),
+            Some("custom-model")
+        );
     }
 
     #[tokio::test]

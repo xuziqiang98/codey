@@ -4,6 +4,7 @@ use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
 use crate::auth::AuthMode;
 use crate::config::Config;
+use crate::config::ConfigToml;
 use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::Result as CoreResult;
@@ -20,6 +21,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use http::HeaderMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
@@ -47,11 +49,12 @@ pub enum RefreshStrategy {
 /// Coordinates remote model discovery plus cached metadata on disk.
 #[derive(Debug)]
 pub struct ModelsManager {
+    codex_home: PathBuf,
     local_models: Vec<ModelPreset>,
     remote_models: RwLock<Vec<ModelInfo>>,
     auth_manager: Arc<AuthManager>,
     etag: RwLock<Option<String>>,
-    cache_manager: ModelsCacheManager,
+    cache_manager: StdRwLock<ModelsCacheManager>,
     provider: StdRwLock<ModelProviderInfo>,
 }
 
@@ -69,11 +72,12 @@ impl ModelsManager {
         let cache_path = models_cache_path(&codex_home, model_provider_id);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
+            codex_home,
             local_models: builtin_model_presets(auth_manager.get_internal_auth_mode()),
             remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
             auth_manager,
             etag: RwLock::new(None),
-            cache_manager,
+            cache_manager: StdRwLock::new(cache_manager),
             provider: StdRwLock::new(provider),
         }
     }
@@ -83,6 +87,24 @@ impl ModelsManager {
             .provider
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
+    }
+
+    pub async fn switch_provider(&self, model_provider_id: &str, provider: ModelProviderInfo) {
+        *self
+            .cache_manager
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ModelsCacheManager::new(
+            models_cache_path(&self.codex_home, model_provider_id),
+            DEFAULT_MODEL_CACHE_TTL,
+        );
+        *self
+            .provider
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
+        *self.remote_models.write().await =
+            Self::load_remote_models_from_file().unwrap_or_default();
+        *self.etag.write().await = None;
+        self.try_load_cache().await;
     }
 
     /// List all available models, refreshing according to the specified strategy.
@@ -117,6 +139,20 @@ impl ModelsManager {
         self.build_picker_models(config, available_models)
     }
 
+    /// List the models that should be shown by the `/model` command.
+    ///
+    /// Without ChatGPT auth, this is limited to models explicitly declared in
+    /// `config.toml`. With ChatGPT auth, the full picker list is shown and any
+    /// additional configured models are appended.
+    pub async fn list_model_switcher_models(
+        &self,
+        config: &Config,
+        refresh_strategy: RefreshStrategy,
+    ) -> Vec<ModelPreset> {
+        let available_models = self.list_models(config, refresh_strategy).await;
+        self.build_model_switcher_models(config, available_models)
+    }
+
     /// List collaboration mode presets.
     ///
     /// Returns a static set of presets seeded with the configured model.
@@ -139,6 +175,15 @@ impl ModelsManager {
     ) -> Result<Vec<ModelPreset>, TryLockError> {
         let available_models = self.try_list_models(config)?;
         Ok(self.build_picker_models(config, available_models))
+    }
+
+    /// Attempt to list `/model` command models without blocking, using cached state.
+    pub fn try_list_model_switcher_models(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<ModelPreset>, TryLockError> {
+        let available_models = self.try_list_models(config)?;
+        Ok(self.build_model_switcher_models(config, available_models))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -193,7 +238,7 @@ impl ModelsManager {
     pub(crate) async fn refresh_if_new_etag(&self, etag: String, config: &Config) {
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
-            if let Err(err) = self.cache_manager.renew_cache_ttl().await {
+            if let Err(err) = self.cache_manager_snapshot().renew_cache_ttl().await {
                 error!("failed to renew cache TTL: {err}");
             }
             return;
@@ -260,7 +305,9 @@ impl ModelsManager {
 
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
-        self.cache_manager.persist_cache(&models, etag).await;
+        self.cache_manager_snapshot()
+            .persist_cache(&models, etag)
+            .await;
         Ok(())
     }
 
@@ -294,7 +341,7 @@ impl ModelsManager {
     async fn try_load_cache(&self) -> bool {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
-        let cache = match self.cache_manager.load_fresh().await {
+        let cache = match self.cache_manager_snapshot().load_fresh().await {
             Some(cache) => cache,
             None => return false,
         };
@@ -366,6 +413,85 @@ impl ModelsManager {
         }
     }
 
+    fn build_model_switcher_models(
+        &self,
+        config: &Config,
+        available_models: Vec<ModelPreset>,
+    ) -> Vec<ModelPreset> {
+        let configured_models = self.configured_picker_models(config, &available_models);
+        if !matches!(
+            self.auth_manager.get_internal_auth_mode(),
+            Some(AuthMode::Chatgpt)
+        ) {
+            return configured_models;
+        }
+
+        let mut picker_models = self.build_picker_models(config, available_models);
+        for mut configured_model in configured_models {
+            if picker_models
+                .iter()
+                .any(|picker_model| picker_model.model == configured_model.model)
+            {
+                continue;
+            }
+            configured_model.is_default = false;
+            picker_models.push(configured_model);
+        }
+        picker_models
+    }
+
+    fn configured_picker_models(
+        &self,
+        config: &Config,
+        available_models: &[ModelPreset],
+    ) -> Vec<ModelPreset> {
+        let Some(config_toml) = self.config_toml(config) else {
+            return Vec::new();
+        };
+
+        let mut seen_models = HashSet::new();
+        let mut configured_models = Vec::new();
+
+        if let Some(model) = config_toml
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            && seen_models.insert(model.to_string())
+        {
+            configured_models.push(model.to_string());
+        }
+
+        let mut profile_models: Vec<String> = config_toml
+            .profiles
+            .into_values()
+            .filter_map(|profile| profile.model)
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .collect();
+        profile_models.sort();
+
+        for model in profile_models {
+            if seen_models.insert(model.clone()) {
+                configured_models.push(model);
+            }
+        }
+
+        let mut presets: Vec<ModelPreset> = configured_models
+            .into_iter()
+            .map(|model| self.configured_model_from_config_toml(&model, config, available_models))
+            .collect();
+
+        for preset in &mut presets {
+            preset.is_default = false;
+        }
+        if let Some(default) = presets.first_mut() {
+            default.is_default = true;
+        }
+
+        presets
+    }
+
     fn configured_picker_model(
         &self,
         config: &Config,
@@ -388,10 +514,7 @@ impl ModelsManager {
             id: model.to_string(),
             model: model.to_string(),
             display_name: model.to_string(),
-            description: format!(
-                "Configured model from config.toml for provider {}.",
-                config.model_provider_id
-            ),
+            description: "Configured model from config.toml.".to_string(),
             default_reasoning_effort,
             supported_reasoning_efforts: model_info.supported_reasoning_levels,
             supports_personality,
@@ -400,6 +523,46 @@ impl ModelsManager {
             show_in_picker: true,
             supported_in_api: true,
         })
+    }
+
+    fn configured_model_from_config_toml(
+        &self,
+        model: &str,
+        config: &Config,
+        available_models: &[ModelPreset],
+    ) -> ModelPreset {
+        if let Some(existing) = available_models.iter().find(|preset| preset.model == model) {
+            let mut preset = existing.clone();
+            preset.show_in_picker = true;
+            preset.is_default = false;
+            return preset;
+        }
+
+        let model_info =
+            model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config);
+        let default_reasoning_effort = config
+            .model_reasoning_effort
+            .or(model_info.default_reasoning_level)
+            .unwrap_or(ReasoningEffort::Medium);
+        let supports_personality = model_info.supports_personality();
+
+        ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: "Configured model from config.toml.".to_string(),
+            default_reasoning_effort,
+            supported_reasoning_efforts: model_info.supported_reasoning_levels,
+            supports_personality,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+        }
+    }
+
+    fn config_toml(&self, config: &Config) -> Option<ConfigToml> {
+        config.config_layer_stack.effective_config().try_into().ok()
     }
 
     pub fn is_configured_custom_model(
@@ -456,6 +619,13 @@ impl ModelsManager {
 
     fn provider_snapshot(&self) -> ModelProviderInfo {
         self.provider
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cache_manager_snapshot(&self) -> ModelsCacheManager {
+        self.cache_manager
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -599,6 +769,17 @@ mod tests {
             requires_openai_auth: false,
             supports_websockets: false,
         }
+    }
+
+    async fn load_config_from_toml(codex_home: &tempfile::TempDir, config_toml: &str) -> Config {
+        tokio::fs::write(codex_home.path().join("config.toml"), config_toml)
+            .await
+            .expect("write config.toml");
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load test config")
     }
 
     #[tokio::test]
@@ -878,8 +1059,12 @@ mod tests {
             .expect("initial refresh succeeds");
 
         // Rewrite cache with an old timestamp so it is treated as stale.
-        manager
+        let cache_manager = manager
             .cache_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        cache_manager
             .manipulate_cache_for_test(|fetched_at| {
                 *fetched_at = Utc::now() - chrono::Duration::hours(1);
             })
@@ -937,13 +1122,17 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
-        let mut manager = ModelsManager::with_provider(
+        let manager = ModelsManager::with_provider(
             codex_home.path().to_path_buf(),
             auth_manager,
             "mock-provider",
             provider,
         );
-        manager.cache_manager.set_ttl(Duration::ZERO);
+        manager
+            .cache_manager
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_ttl(Duration::ZERO);
 
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
@@ -1045,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_picker_models_without_auth_returns_only_configured_custom_model() {
+    async fn list_model_switcher_models_without_auth_returns_only_configured_custom_model() {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager = Arc::new(AuthManager::new(
             codex_home.path().to_path_buf(),
@@ -1058,16 +1247,16 @@ mod tests {
             "openai",
             ModelProviderInfo::create_openai_provider(),
         );
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load default test config");
-        config.model = Some("mock-model".to_string());
-        config.model_provider_id = "mock-provider".to_string();
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+"#,
+        )
+        .await;
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
 
         assert_eq!(picker_models.len(), 1);
@@ -1075,14 +1264,66 @@ mod tests {
         assert_eq!(picker_models[0].display_name, "mock-model");
         assert_eq!(
             picker_models[0].description,
-            "Configured model from config.toml for provider mock-provider."
+            "Configured model from config.toml."
         );
         assert!(picker_models[0].is_default);
         assert!(picker_models[0].show_in_picker);
     }
 
     #[tokio::test]
-    async fn list_picker_models_with_auth_appends_configured_custom_model() {
+    async fn list_model_switcher_models_without_chatgpt_auth_returns_all_models_in_config_toml() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+
+[profiles.fast]
+model = "deepseek-r1"
+
+[profiles.other]
+model_provider = "other-provider"
+model = "claude-sonnet"
+
+[profiles.duplicate]
+model = "deepseek-r1"
+"#,
+        )
+        .await;
+
+        let picker_models = manager
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
+            .await;
+        let models = picker_models
+            .iter()
+            .map(|preset| preset.model.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(models, vec!["mock-model", "claude-sonnet", "deepseek-r1"]);
+        assert_eq!(
+            picker_models
+                .iter()
+                .filter(|preset| preset.is_default)
+                .count(),
+            1
+        );
+        assert_eq!(picker_models[0].model, "mock-model");
+        assert!(picker_models[0].is_default);
+    }
+
+    #[tokio::test]
+    async fn list_model_switcher_models_with_auth_appends_configured_models() {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
@@ -1092,16 +1333,19 @@ mod tests {
             "openai",
             ModelProviderInfo::create_openai_provider(),
         );
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load default test config");
-        config.model = Some("mock-model".to_string());
-        config.model_provider_id = "mock-provider".to_string();
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+
+[profiles.fast]
+model = "deepseek-r1"
+"#,
+        )
+        .await;
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
 
         assert_eq!(
@@ -1110,7 +1354,7 @@ mod tests {
         );
         assert_eq!(
             picker_models.last().map(|preset| preset.model.as_str()),
-            Some("mock-model")
+            Some("deepseek-r1")
         );
         assert_eq!(
             picker_models
@@ -1124,10 +1368,47 @@ mod tests {
                 .iter()
                 .any(|preset| preset.model == "gpt-5.2-codex" && preset.is_default)
         );
+        assert!(
+            picker_models
+                .iter()
+                .any(|preset| preset.model == "mock-model")
+        );
     }
 
     #[tokio::test]
-    async fn list_picker_models_with_provider_bearer_token_appends_configured_custom_model() {
+    async fn list_model_switcher_models_with_api_key_auth_returns_only_models_in_config_toml() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test"));
+        let manager = ModelsManager::new(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            "openai",
+            ModelProviderInfo::create_openai_provider(),
+        );
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+"#,
+        )
+        .await;
+
+        let picker_models = manager
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
+            .await;
+
+        assert_eq!(
+            picker_models
+                .iter()
+                .map(|preset| preset.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mock-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_model_switcher_models_with_provider_bearer_token_returns_only_models_in_config_toml()
+     {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager = Arc::new(AuthManager::new(
             codex_home.path().to_path_buf(),
@@ -1142,30 +1423,24 @@ mod tests {
             "mock-provider",
             provider,
         );
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load default test config");
-        config.model = Some("mock-model".to_string());
-        config.model_provider_id = "mock-provider".to_string();
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+"#,
+        )
+        .await;
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
 
-        assert_eq!(
-            picker_models.first().map(|preset| preset.model.as_str()),
-            Some("gpt-5.2-codex")
-        );
-        assert_eq!(
-            picker_models.last().map(|preset| preset.model.as_str()),
-            Some("mock-model")
-        );
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
     }
 
     #[tokio::test]
-    async fn list_picker_models_with_provider_env_key_appends_configured_custom_model() {
+    async fn list_model_switcher_models_with_provider_env_key_returns_only_models_in_config_toml() {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager = Arc::new(AuthManager::new(
             codex_home.path().to_path_buf(),
@@ -1180,30 +1455,24 @@ mod tests {
             "mock-provider",
             provider,
         );
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load default test config");
-        config.model = Some("mock-model".to_string());
-        config.model_provider_id = "mock-provider".to_string();
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+"#,
+        )
+        .await;
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
 
-        assert_eq!(
-            picker_models.first().map(|preset| preset.model.as_str()),
-            Some("gpt-5.2-codex")
-        );
-        assert_eq!(
-            picker_models.last().map(|preset| preset.model.as_str()),
-            Some("mock-model")
-        );
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
     }
 
     #[tokio::test]
-    async fn set_provider_updates_picker_auth_state() {
+    async fn set_provider_does_not_expand_model_switcher_without_chatgpt_auth() {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager = Arc::new(AuthManager::new(
             codex_home.path().to_path_buf(),
@@ -1216,16 +1485,16 @@ mod tests {
             "mock-provider",
             provider_for("http://example.test".to_string()),
         );
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load default test config");
-        config.model = Some("mock-model".to_string());
-        config.model_provider_id = "mock-provider".to_string();
+        let config = load_config_from_toml(
+            &codex_home,
+            r#"
+model = "mock-model"
+"#,
+        )
+        .await;
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
         assert_eq!(picker_models.len(), 1);
         assert_eq!(picker_models[0].model, "mock-model");
@@ -1235,16 +1504,10 @@ mod tests {
         manager.set_provider(updated_provider);
 
         let picker_models = manager
-            .list_picker_models(&config, RefreshStrategy::Offline)
+            .list_model_switcher_models(&config, RefreshStrategy::Offline)
             .await;
-        assert_eq!(
-            picker_models.first().map(|preset| preset.model.as_str()),
-            Some("gpt-5.2-codex")
-        );
-        assert_eq!(
-            picker_models.last().map(|preset| preset.model.as_str()),
-            Some("mock-model")
-        );
+        assert_eq!(picker_models.len(), 1);
+        assert_eq!(picker_models[0].model, "mock-model");
     }
 
     #[tokio::test]

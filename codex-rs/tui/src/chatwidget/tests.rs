@@ -3059,6 +3059,7 @@ async fn experimental_features_toggle_saves_on_exit() {
 async fn model_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
     chat.open_model_popup();
 
     let popup = render_bottom_popup(&chat, 80);
@@ -3127,7 +3128,17 @@ async fn model_picker_without_auth_shows_only_configured_custom_model() {
         chat.config.model_provider_id.as_str(),
         chat.config.model_provider.clone(),
     ));
-    chat.config.model_provider_id = "mock_provider".to_string();
+    reload_chat_config_with_saved_providers(
+        &mut chat,
+        vec![CustomProviderConfig {
+            provider_id: "mock_provider".to_string(),
+            wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+            base_url: "https://example.test/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "mock-model".to_string(),
+        }],
+    )
+    .await;
 
     chat.open_model_popup();
 
@@ -3143,7 +3154,7 @@ async fn model_picker_without_auth_shows_only_configured_custom_model() {
 }
 
 #[tokio::test]
-async fn model_picker_without_auth_shows_saved_models_for_current_custom_provider() {
+async fn model_picker_without_auth_shows_all_models_saved_in_config_toml() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.auth_manager = Arc::new(AuthManager::new(
@@ -3159,28 +3170,31 @@ async fn model_picker_without_auth_shows_saved_models_for_current_custom_provide
     ));
     reload_chat_config_with_saved_providers(
         &mut chat,
-        vec![CustomProviderConfig {
-            provider_id: "mock_provider".to_string(),
-            wire_api: crate::provider_config::ApiProviderWireApi::Responses,
-            base_url: "https://example.test/v1".to_string(),
-            api_key: "sk-test".to_string(),
-            model: "deepseek-r1".to_string(),
-        }],
+        vec![
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "mock-model".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "deepseek-r1".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "other_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "claude-sonnet".to_string(),
+            },
+        ],
     )
     .await;
-    chat.config.model = Some("mock-model".to_string());
-    chat.config.model_provider.experimental_bearer_token = None;
-    chat.config
-        .model_providers
-        .get_mut("mock_provider")
-        .expect("mock provider")
-        .experimental_bearer_token = None;
-    chat.models_manager = Arc::new(ModelsManager::new(
-        chat.config.codex_home.clone(),
-        chat.auth_manager.clone(),
-        chat.config.model_provider_id.as_str(),
-        chat.config.model_provider.clone(),
-    ));
     chat.set_model("mock-model");
 
     chat.open_model_popup();
@@ -3195,8 +3209,52 @@ async fn model_picker_without_auth_shows_saved_models_for_current_custom_provide
         "expected saved model to appear in picker:\n{popup}"
     );
     assert!(
+        popup.contains("claude-sonnet"),
+        "expected models from other providers in config.toml to appear in picker:\n{popup}"
+    );
+    assert!(
         !popup.contains("gpt-5.2-codex"),
         "expected built-in picker models to be hidden without auth:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_with_chatgpt_auth_shows_full_list_and_config_models() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
+    reload_chat_config_with_saved_providers(
+        &mut chat,
+        vec![
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "mock-model".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "deepseek-r1".to_string(),
+            },
+        ],
+    )
+    .await;
+    chat.set_model("mock-model");
+
+    chat.open_model_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("gpt-5.2-codex"),
+        "expected the full built-in model list with ChatGPT auth:\n{popup}"
+    );
+    assert!(
+        popup.contains("deepseek-r1"),
+        "expected configured models to remain visible with ChatGPT auth:\n{popup}"
     );
 }
 
@@ -3468,6 +3526,7 @@ async fn feedback_upload_consent_popup_snapshot() {
 async fn reasoning_popup_escape_returns_to_model_popup() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
     chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
     chat.open_model_popup();
 
     let preset = get_available_model(&chat, "gpt-5.1-codex-max");
@@ -3583,57 +3642,6 @@ async fn providers_command_is_disabled_while_task_running() {
     let blob = lines_to_single_string(cells.last().expect("error message cell"));
     assert!(blob.contains("'/providers' is disabled while a task is in progress."));
     assert!(!render_bottom_popup(&chat, 80).contains("Configure a custom API provider"));
-}
-
-#[tokio::test]
-async fn saved_and_remote_custom_models_merge_without_duplicates() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
-    reload_chat_config_with_saved_providers(
-        &mut chat,
-        vec![
-            CustomProviderConfig {
-                provider_id: "mock_provider".to_string(),
-                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
-                base_url: "https://example.test/v1".to_string(),
-                api_key: "sk-test".to_string(),
-                model: "remote-model".to_string(),
-            },
-            CustomProviderConfig {
-                provider_id: "mock_provider".to_string(),
-                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
-                base_url: "https://example.test/v1".to_string(),
-                api_key: "sk-test".to_string(),
-                model: "local-only".to_string(),
-            },
-        ],
-    )
-    .await;
-
-    let preset = |slug: &str| ModelPreset {
-        id: slug.to_string(),
-        model: slug.to_string(),
-        display_name: slug.to_string(),
-        description: format!("{slug} description"),
-        default_reasoning_effort: ReasoningEffortConfig::Medium,
-        supported_reasoning_efforts: vec![ReasoningEffortPreset {
-            effort: ReasoningEffortConfig::Medium,
-            description: "medium".to_string(),
-        }],
-        supports_personality: false,
-        is_default: false,
-        upgrade: None,
-        show_in_picker: true,
-        supported_in_api: true,
-    };
-
-    let merged = chat
-        .merge_saved_provider_model_presets(vec![preset("remote-model"), preset("remote-other")]);
-    let models = merged
-        .into_iter()
-        .map(|preset| preset.model)
-        .collect::<Vec<_>>();
-
-    assert_eq!(models, vec!["remote-model", "remote-other", "local-only"]);
 }
 
 #[tokio::test]

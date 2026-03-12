@@ -650,7 +650,7 @@ impl App {
     async fn reload_runtime_provider_config(
         &mut self,
         provider_id: &str,
-        is_active_provider: bool,
+        model: &str,
     ) -> std::result::Result<(), String> {
         let mut reloaded = self
             .rebuild_config_for_cwd(self.config.cwd.clone())
@@ -666,24 +666,38 @@ impl App {
                 format!("saved provider `{provider_id}` was not found after reloading config")
             })?;
 
-        self.config.config_layer_stack = reloaded.config_layer_stack.clone();
-        self.config.model_providers = reloaded.model_providers.clone();
-        if is_active_provider {
-            self.config.model_provider = provider.clone();
-        }
-        self.chat_widget
-            .sync_provider_config(&self.config, is_active_provider);
-
-        if is_active_provider {
+        if let Some(thread_id) = self.chat_widget.thread_id() {
+            match self.server.get_thread(thread_id).await {
+                Ok(thread) => {
+                    thread
+                        .switch_provider_and_model(
+                            provider_id.to_string(),
+                            provider.clone(),
+                            model.to_string(),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    self.server
+                        .get_models_manager()
+                        .switch_provider(provider_id, provider.clone())
+                        .await;
+                }
+            }
+        } else {
             self.server
                 .get_models_manager()
-                .set_provider(provider.clone());
-            if let Some(thread_id) = self.chat_widget.thread_id()
-                && let Ok(thread) = self.server.get_thread(thread_id).await
-            {
-                thread.update_model_provider(provider).await;
-            }
+                .switch_provider(provider_id, provider.clone())
+                .await;
         }
+
+        self.config.config_layer_stack = reloaded.config_layer_stack.clone();
+        self.config.model_providers = reloaded.model_providers.clone();
+        self.config.model_provider_id = provider_id.to_string();
+        self.config.model_provider = provider;
+        self.config.model = Some(model.to_string());
+        self.chat_widget.sync_provider_config(&self.config, true);
+        self.chat_widget.set_model(model);
 
         Ok(())
     }
@@ -691,31 +705,27 @@ impl App {
     async fn handle_custom_provider_configured(&mut self, config: CustomProviderConfig) {
         let provider_id = config.provider_id.clone();
         let model = config.model.clone();
-        let is_active_provider = provider_id == self.config.model_provider_id;
 
         self.chat_widget.dismiss_active_view();
 
         match self
-            .reload_runtime_provider_config(&provider_id, is_active_provider)
+            .reload_runtime_provider_config(&provider_id, &model)
             .await
         {
             Ok(()) => {
-                let hint = if is_active_provider {
-                    Some(
-                        "Updated this session's provider settings. Use /model to switch to the saved model."
-                            .to_string(),
-                    )
-                } else {
-                    Some("Restart Codex to start a session with this provider.".to_string())
-                };
                 self.chat_widget.add_info_message(
-                    format!("Saved provider `{provider_id}` with model `{model}`."),
-                    hint,
+                    format!(
+                        "Switched this session to provider `{provider_id}` with model `{model}`."
+                    ),
+                    Some(
+                        "Future sessions will also use this provider and model by default."
+                            .to_string(),
+                    ),
                 );
             }
             Err(err) => {
                 self.chat_widget.add_error_message(format!(
-                    "Saved provider `{provider_id}` with model `{model}`, but failed to refresh runtime config: {err}. Restart Codex to use the updated settings."
+                    "Saved provider `{provider_id}` with model `{model}`, but failed to activate it in this session: {err}. Restart Codex to use the updated settings."
                 ));
             }
         }
@@ -3241,6 +3251,14 @@ X-Test = "1"
             app.chat_widget.config_ref().model_provider,
             app.config.model_provider
         );
+        assert_eq!(app.config.model_provider_id, "custom_1");
+        assert_eq!(app.config.model.as_deref(), Some("gpt-other"));
+        assert_eq!(app.chat_widget.current_model(), "gpt-other");
+        assert_eq!(
+            app.chat_widget.config_ref().model.as_deref(),
+            Some("gpt-other")
+        );
+        assert_eq!(app.chat_widget.config_ref().model_provider_id, "custom_1");
 
         let config_toml: ConfigToml = app
             .config
@@ -3258,7 +3276,7 @@ X-Test = "1"
     }
 
     #[tokio::test]
-    async fn custom_provider_save_keeps_runtime_provider_for_inactive_provider() {
+    async fn custom_provider_save_switches_runtime_provider_for_new_provider() {
         let mut app = make_test_app().await;
         let saved = CustomProviderConfig {
             provider_id: "custom_1".to_string(),
@@ -3272,13 +3290,17 @@ X-Test = "1"
             .apply()
             .await
             .expect("persist provider save");
-        let original_provider_id = app.config.model_provider_id.clone();
-        let original_provider = app.config.model_provider.clone();
 
         app.handle_custom_provider_configured(saved).await;
 
-        assert_eq!(app.config.model_provider_id, original_provider_id);
-        assert_eq!(app.config.model_provider, original_provider);
+        assert_eq!(app.config.model_provider_id, "custom_1");
+        assert_eq!(app.config.model.as_deref(), Some("gpt-test"));
+        assert_eq!(app.chat_widget.current_model(), "gpt-test");
+        assert_eq!(app.chat_widget.config_ref().model_provider_id, "custom_1");
+        assert_eq!(
+            app.chat_widget.config_ref().model.as_deref(),
+            Some("gpt-test")
+        );
 
         let config_toml: ConfigToml = app
             .config
@@ -3293,5 +3315,43 @@ X-Test = "1"
                 .and_then(|profile| profile.model_provider.as_deref()),
             Some("custom_1")
         );
+    }
+
+    #[tokio::test]
+    async fn custom_provider_save_switches_active_thread_provider_and_model() {
+        let mut app = make_test_app().await;
+        let new_thread = app
+            .server
+            .start_thread(app.config.clone())
+            .await
+            .expect("start thread");
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(new_thread.session_configured.clone()),
+        });
+
+        let saved = CustomProviderConfig {
+            provider_id: "custom_1".to_string(),
+            wire_api: ApiProviderWireApi::Responses,
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-test".to_string(),
+        };
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits(build_custom_provider_edits(&saved))
+            .apply()
+            .await
+            .expect("persist provider save");
+
+        app.handle_custom_provider_configured(saved).await;
+
+        let thread = app
+            .server
+            .get_thread(new_thread.thread_id)
+            .await
+            .expect("get thread");
+        let snapshot = thread.config_snapshot().await;
+        assert_eq!(snapshot.model_provider_id, "custom_1");
+        assert_eq!(snapshot.model, "gpt-test");
     }
 }

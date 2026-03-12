@@ -160,10 +160,6 @@ pub(crate) fn generated_profile_name(provider_id: &str, model: &str) -> String {
     format!("{GENERATED_PROFILE_PREFIX}{provider_id}.{model}")
 }
 
-pub(crate) fn generated_profile_prefix(provider_id: &str) -> String {
-    format!("{GENERATED_PROFILE_PREFIX}{provider_id}.")
-}
-
 pub(crate) fn current_step_value_mut(state: &mut ApiKeyInputState) -> Option<&mut String> {
     match state.step {
         ApiProviderWizardStep::ProviderId => Some(&mut state.provider_id),

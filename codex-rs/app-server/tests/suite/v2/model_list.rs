@@ -336,8 +336,7 @@ async fn list_models_without_auth_returns_only_configured_custom_model() -> Resu
             id: "mock-model".to_string(),
             model: "mock-model".to_string(),
             display_name: "mock-model".to_string(),
-            description: "Configured model from config.toml for provider mock_provider."
-                .to_string(),
+            description: "Configured model from config.toml.".to_string(),
             supported_reasoning_efforts: vec![],
             default_reasoning_effort: ReasoningEffort::Medium,
             supports_personality: false,
@@ -396,7 +395,7 @@ async fn list_models_with_auth_appends_configured_custom_model() -> Result<()> {
     );
     assert_eq!(
         items.last().map(|model| model.description.as_str()),
-        Some("Configured model from config.toml for provider mock_provider.")
+        Some("Configured model from config.toml.")
     );
     Ok(())
 }

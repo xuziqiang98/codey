@@ -11,7 +11,7 @@ use tokio::fs;
 use tracing::error;
 
 /// Manages loading and saving of models cache to disk.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ModelsCacheManager {
     cache_path: PathBuf,
     cache_ttl: Duration,

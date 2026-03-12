@@ -33,9 +33,7 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
-use codex_core::config::ConfigToml;
 use codex_core::config::ConstraintResult;
-use codex_core::config::profile::ConfigProfile;
 use codex_core::config::types::Notifications;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
@@ -177,7 +175,6 @@ use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::markdown::append_markdown;
-use crate::provider_config::generated_profile_prefix;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::FlexRenderable;
@@ -214,7 +211,6 @@ use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
 
@@ -3859,19 +3855,20 @@ impl ChatWidget {
             return;
         }
 
-        let presets: Vec<ModelPreset> =
-            match self.models_manager.try_list_picker_models(&self.config) {
-                Ok(models) => models,
-                Err(_) => {
-                    self.add_info_message(
-                        "Models are being updated; please try /model again in a moment."
-                            .to_string(),
-                        None,
-                    );
-                    return;
-                }
-            };
-        self.open_model_popup_with_presets(self.merge_saved_provider_model_presets(presets));
+        let presets: Vec<ModelPreset> = match self
+            .models_manager
+            .try_list_model_switcher_models(&self.config)
+        {
+            Ok(models) => models,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try /model again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+        self.open_model_popup_with_presets(presets);
     }
 
     pub(crate) fn open_provider_popup(&mut self) {
@@ -4070,69 +4067,6 @@ impl ChatWidget {
             header,
             ..Default::default()
         });
-    }
-
-    fn merge_saved_provider_model_presets(
-        &self,
-        mut presets: Vec<ModelPreset>,
-    ) -> Vec<ModelPreset> {
-        let prefix = generated_profile_prefix(self.config.model_provider_id.as_str());
-        let mut known_models: HashSet<String> =
-            presets.iter().map(|preset| preset.model.clone()).collect();
-        let configured_profiles = self.configured_profiles();
-
-        let mut saved_models: Vec<ModelPreset> = configured_profiles
-            .iter()
-            .filter(|(name, profile)| {
-                name.starts_with(&prefix)
-                    && profile.model_provider.as_deref()
-                        == Some(self.config.model_provider_id.as_str())
-            })
-            .filter_map(|(_, profile)| profile.model.as_deref())
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .filter(|model| known_models.insert((*model).to_string()))
-            .map(|model| self.saved_provider_model_preset(model))
-            .collect();
-
-        presets.append(&mut saved_models);
-        presets
-    }
-
-    fn saved_provider_model_preset(&self, model: &str) -> ModelPreset {
-        let default_reasoning_effort = self
-            .config
-            .model_reasoning_effort
-            .unwrap_or(ReasoningEffortConfig::Medium);
-
-        ModelPreset {
-            id: model.to_string(),
-            model: model.to_string(),
-            display_name: model.to_string(),
-            description: format!(
-                "Saved model from config.toml for provider {}.",
-                self.config.model_provider_id
-            ),
-            default_reasoning_effort,
-            supported_reasoning_efforts: vec![ReasoningEffortPreset {
-                effort: default_reasoning_effort,
-                description: "Saved locally".to_string(),
-            }],
-            supports_personality: false,
-            is_default: false,
-            upgrade: None,
-            show_in_picker: true,
-            supported_in_api: true,
-        }
-    }
-
-    fn configured_profiles(&self) -> HashMap<String, ConfigProfile> {
-        self.config
-            .config_layer_stack
-            .effective_config()
-            .try_into()
-            .map(|config: ConfigToml| config.profiles)
-            .unwrap_or_default()
     }
 
     fn is_auto_model(model: &str) -> bool {
@@ -5271,8 +5205,10 @@ impl ChatWidget {
 
     pub(crate) fn sync_provider_config(&mut self, config: &Config, update_active_provider: bool) {
         self.config.config_layer_stack = config.config_layer_stack.clone();
+        self.config.model = config.model.clone();
         self.config.model_providers = config.model_providers.clone();
         if update_active_provider {
+            self.config.model_provider_id = config.model_provider_id.clone();
             self.config.model_provider = config.model_provider.clone();
         }
         self.request_redraw();
