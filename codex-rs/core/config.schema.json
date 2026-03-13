@@ -253,6 +253,10 @@
         "model": {
           "type": "string"
         },
+        "model_context_window": {
+          "format": "int64",
+          "type": "integer"
+        },
         "model_instructions_file": {
           "allOf": [
             {

@@ -63,7 +63,9 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
+use crate::dynamic_context_window::DynamicContextWindowFailure;
 use crate::dynamic_context_window::DynamicContextWindowState;
+use crate::dynamic_context_window::DynamicContextWindowSuccess;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::features::FEATURES;
@@ -92,6 +94,12 @@ struct ModelClientState {
     summary: ReasoningSummaryConfig,
     session_source: SessionSource,
     transport_manager: TransportManager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DynamicContextWindowStatus {
+    pub(crate) current_context_window: i64,
+    pub(crate) locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +264,10 @@ impl ModelClient {
         self.state.auth_manager.clone()
     }
 
-    pub(crate) fn maybe_upgrade_dynamic_context_window(&self, input_tokens: i64) -> Option<i64> {
+    pub(crate) fn record_dynamic_context_window_success(
+        &self,
+        input_tokens: i64,
+    ) -> Option<DynamicContextWindowSuccess> {
         let effective_context_window_percent =
             self.state.model_info.effective_context_window_percent;
         self.state
@@ -266,13 +277,43 @@ impl ModelClient {
                 window
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .maybe_upgrade(input_tokens, effective_context_window_percent)
+                    .record_success(input_tokens, effective_context_window_percent)
             })
     }
 
-    pub(crate) fn record_dynamic_context_window_retry(
+    pub(crate) fn should_defer_auto_compact_until_after_dynamic_probe(&self) -> bool {
+        self.state
+            .dynamic_context_window
+            .as_ref()
+            .is_some_and(|window| {
+                !window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_locked()
+            })
+    }
+
+    pub(crate) fn dynamic_context_window_auto_compact_limit(&self) -> Option<i64> {
+        self.state
+            .dynamic_context_window
+            .as_ref()
+            .and_then(|_| self.get_model_context_window())
+    }
+
+    pub(crate) fn dynamic_context_window_status(&self) -> Option<DynamicContextWindowStatus> {
+        self.state.dynamic_context_window.as_ref().map(|window| {
+            let window = window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            DynamicContextWindowStatus {
+                current_context_window: window.current_context_window(),
+                locked: window.is_locked(),
+            }
+        })
+    }
+
+    pub(crate) fn should_preflight_dynamic_context_window_compact(
         &self,
-        turn_id: &str,
         input_tokens: i64,
     ) -> bool {
         let effective_context_window_percent =
@@ -284,7 +325,29 @@ impl ModelClient {
                 window
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record_compact_retry(turn_id, input_tokens, effective_context_window_percent)
+                    .should_preflight_compact(input_tokens, effective_context_window_percent)
+            })
+    }
+
+    pub(crate) fn record_dynamic_context_window_probe_failure(
+        &self,
+        turn_id: &str,
+        input_tokens: i64,
+    ) -> DynamicContextWindowFailure {
+        let effective_context_window_percent =
+            self.state.model_info.effective_context_window_percent;
+        self.state
+            .dynamic_context_window
+            .as_ref()
+            .map(|window| {
+                window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_probe_failure(turn_id, input_tokens, effective_context_window_percent)
+            })
+            .unwrap_or(DynamicContextWindowFailure {
+                should_retry: false,
+                learned_context_window: None,
             })
     }
 

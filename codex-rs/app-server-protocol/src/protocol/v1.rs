@@ -333,6 +333,7 @@ pub struct GetUserSavedConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SetDefaultModelParams {
     pub model: Option<String>,
+    pub model_provider: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 

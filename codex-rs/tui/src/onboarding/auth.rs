@@ -1,23 +1,14 @@
 #![allow(clippy::unwrap_used)]
 
-use codex_api::ApiError;
-use codex_api::AuthProvider;
-use codex_api::ModelsClient;
-use codex_api::Provider;
-use codex_api::ReqwestTransport;
-use codex_api::TransportError;
-use codex_api::WireApi as ApiWireApi;
-use codex_api::provider::RetryConfig;
+use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::CLIENT_ID;
-use codex_core::config::edit::ConfigEdit;
-use codex_core::config::edit::ConfigEditsBuilder;
-use codex_core::default_client::build_reqwest_client;
 use codex_login::DeviceCode;
 use codex_login::ServerOptions;
 use codex_login::ShutdownHandle;
 use codex_login::run_login_server;
+use codex_protocol::config_types::ForcedLoginMethod;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -38,25 +29,26 @@ use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
-use reqwest::StatusCode;
-use reqwest::header::HeaderMap;
-
-use codex_app_server_protocol::AuthMode;
-use codex_protocol::config_types::ForcedLoginMethod;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 use textwrap::wrap;
-use toml_edit::value;
 
 use crate::LoginStatus;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
+use crate::provider_config::ApiProviderWireApi;
+use crate::provider_config::ApiProviderWizardStep;
+use crate::provider_config::CustomProviderConfig;
+use crate::provider_config::current_step_value_mut;
+use crate::provider_config::persist_custom_provider_config;
+use crate::provider_config::snapshot_custom_provider_config;
+use crate::provider_config::validate_current_step;
 use crate::shimmer::shimmer_spans;
 use crate::tui::FrameRequester;
 use tokio::sync::Notify;
+
+pub(crate) use crate::provider_config::ApiKeyInputState;
 
 use super::onboarding_screen::StepState;
 
@@ -82,144 +74,6 @@ pub(crate) enum SignInOption {
 }
 
 const API_KEY_DISABLED_MESSAGE: &str = "API key login is disabled.";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ApiProviderWizardStep {
-    #[default]
-    ProviderId,
-    WireApi,
-    BaseUrl,
-    ApiKey,
-    Model,
-}
-
-impl ApiProviderWizardStep {
-    const fn index(self) -> usize {
-        match self {
-            Self::ProviderId => 1,
-            Self::WireApi => 2,
-            Self::BaseUrl => 3,
-            Self::ApiKey => 4,
-            Self::Model => 5,
-        }
-    }
-
-    const fn title(self) -> &'static str {
-        match self {
-            Self::ProviderId => "Provider ID",
-            Self::WireApi => "Wire API",
-            Self::BaseUrl => "Base URL",
-            Self::ApiKey => "API Key",
-            Self::Model => "Model",
-        }
-    }
-
-    const fn placeholder(self) -> &'static str {
-        match self {
-            Self::ProviderId => "my-provider",
-            Self::WireApi => "",
-            Self::BaseUrl => "https://example.com/v1",
-            Self::ApiKey => "Paste or type your API key",
-            Self::Model => "gpt-4.1",
-        }
-    }
-
-    const fn previous(self) -> Option<Self> {
-        match self {
-            Self::ProviderId => None,
-            Self::WireApi => Some(Self::ProviderId),
-            Self::BaseUrl => Some(Self::WireApi),
-            Self::ApiKey => Some(Self::BaseUrl),
-            Self::Model => Some(Self::ApiKey),
-        }
-    }
-
-    const fn next(self) -> Option<Self> {
-        match self {
-            Self::ProviderId => Some(Self::WireApi),
-            Self::WireApi => Some(Self::BaseUrl),
-            Self::BaseUrl => Some(Self::ApiKey),
-            Self::ApiKey => Some(Self::Model),
-            Self::Model => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ApiProviderWireApi {
-    Chat,
-    #[default]
-    Responses,
-}
-
-impl ApiProviderWireApi {
-    fn toggle(&mut self) {
-        *self = match self {
-            Self::Chat => Self::Responses,
-            Self::Responses => Self::Chat,
-        };
-    }
-
-    fn as_config_value(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Responses => "responses",
-        }
-    }
-
-    fn as_api_wire(self) -> ApiWireApi {
-        match self {
-            Self::Chat => ApiWireApi::Chat,
-            Self::Responses => ApiWireApi::Responses,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Responses => "responses",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Chat => "Compatible with chat completions style APIs",
-            Self::Responses => "Compatible with Responses API style backends",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct ApiKeyInputState {
-    provider_id: String,
-    wire_api: ApiProviderWireApi,
-    base_url: String,
-    api_key: String,
-    model: String,
-    step: ApiProviderWizardStep,
-    validating: bool,
-    error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CustomProviderConfig {
-    provider_id: String,
-    wire_api: ApiProviderWireApi,
-    base_url: String,
-    api_key: String,
-    model: String,
-}
-
-#[derive(Clone)]
-struct StaticBearerAuth {
-    api_key: String,
-}
-
-impl AuthProvider for StaticBearerAuth {
-    fn bearer_token(&self) -> Option<String> {
-        Some(self.api_key.clone())
-    }
-}
 
 #[derive(Clone)]
 /// Used to manage the lifecycle of SpawnedLogin and ensure it gets cleaned up.
@@ -1085,219 +939,6 @@ impl WidgetRef for AuthModeWidget {
     }
 }
 
-fn current_step_value_mut(state: &mut ApiKeyInputState) -> Option<&mut String> {
-    match state.step {
-        ApiProviderWizardStep::ProviderId => Some(&mut state.provider_id),
-        ApiProviderWizardStep::WireApi => None,
-        ApiProviderWizardStep::BaseUrl => Some(&mut state.base_url),
-        ApiProviderWizardStep::ApiKey => Some(&mut state.api_key),
-        ApiProviderWizardStep::Model => Some(&mut state.model),
-    }
-}
-
-fn validate_current_step(state: &ApiKeyInputState) -> Result<(), String> {
-    match state.step {
-        ApiProviderWizardStep::ProviderId => validate_provider_id(state.provider_id.trim()),
-        ApiProviderWizardStep::WireApi => Ok(()),
-        ApiProviderWizardStep::BaseUrl => validate_base_url(state.base_url.trim()),
-        ApiProviderWizardStep::ApiKey => validate_non_empty(state.api_key.trim(), "API key"),
-        ApiProviderWizardStep::Model => validate_non_empty(state.model.trim(), "Model"),
-    }
-}
-
-fn validate_non_empty(value: &str, field_name: &str) -> Result<(), String> {
-    if value.is_empty() {
-        Err(format!("{field_name} cannot be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_provider_id(provider_id: &str) -> Result<(), String> {
-    validate_non_empty(provider_id, "Provider ID")?;
-    if provider_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-    {
-        Ok(())
-    } else {
-        Err("Provider ID can only contain letters, numbers, '_' or '-'".to_string())
-    }
-}
-
-fn validate_base_url(base_url: &str) -> Result<(), String> {
-    validate_non_empty(base_url, "Base URL")?;
-    let url = url::Url::parse(base_url).map_err(|err| format!("Invalid base URL: {err}"))?;
-    match url.scheme() {
-        "http" | "https" => Ok(()),
-        scheme => Err(format!("Base URL must use http or https, got {scheme}")),
-    }
-}
-
-fn snapshot_custom_provider_config(
-    state: &ApiKeyInputState,
-) -> Result<CustomProviderConfig, String> {
-    let provider_id = state.provider_id.trim().to_string();
-    let base_url = state.base_url.trim().to_string();
-    let api_key = state.api_key.trim().to_string();
-    let model = state.model.trim().to_string();
-
-    validate_provider_id(&provider_id)?;
-    validate_base_url(&base_url)?;
-    validate_non_empty(&api_key, "API key")?;
-    validate_non_empty(&model, "Model")?;
-
-    Ok(CustomProviderConfig {
-        provider_id,
-        wire_api: state.wire_api,
-        base_url,
-        api_key,
-        model,
-    })
-}
-
-async fn persist_custom_provider_config(
-    codex_home: &Path,
-    config: &CustomProviderConfig,
-) -> Result<(), String> {
-    validate_custom_provider_config(config).await?;
-
-    ConfigEditsBuilder::new(codex_home)
-        .with_edits(build_custom_provider_edits(config))
-        .apply()
-        .await
-        .map_err(|err| format!("Failed to write config.toml: {err}"))
-}
-
-async fn validate_custom_provider_config(config: &CustomProviderConfig) -> Result<(), String> {
-    let provider = Provider {
-        name: config.provider_id.clone(),
-        base_url: config.base_url.clone(),
-        query_params: None,
-        wire: config.wire_api.as_api_wire(),
-        headers: HeaderMap::new(),
-        retry: RetryConfig {
-            max_attempts: 1,
-            base_delay: Duration::from_millis(200),
-            retry_429: false,
-            retry_5xx: false,
-            retry_transport: false,
-        },
-        stream_idle_timeout: Duration::from_secs(5),
-    };
-    let client = ModelsClient::new(
-        ReqwestTransport::new(build_reqwest_client()),
-        provider,
-        StaticBearerAuth {
-            api_key: config.api_key.clone(),
-        },
-    );
-
-    match client
-        .list_models(env!("CARGO_PKG_VERSION"), HeaderMap::new())
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(ApiError::Transport(TransportError::Http {
-            status:
-                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED,
-            ..
-        })) => Ok(()),
-        Err(ApiError::Transport(TransportError::Http {
-            status: StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN,
-            ..
-        })) => Err(
-            "Authentication failed while checking the provider. Verify the API key.".to_string(),
-        ),
-        Err(ApiError::Transport(TransportError::Timeout)) => {
-            Err("Timed out while connecting to the provider.".to_string())
-        }
-        Err(ApiError::Transport(TransportError::RetryLimit)) => {
-            Err("Could not connect to the provider after retrying.".to_string())
-        }
-        Err(ApiError::Transport(TransportError::Build(err)))
-        | Err(ApiError::Transport(TransportError::Network(err))) => {
-            Err(format!("Could not connect to the provider: {err}"))
-        }
-        Err(ApiError::Transport(TransportError::Http { .. })) | Err(ApiError::Stream(_)) => Ok(()),
-        Err(ApiError::Api { status, message }) => {
-            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-                Err(format!(
-                    "Authentication failed while checking the provider: {message}"
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        Err(
-            ApiError::ContextWindowExceeded
-            | ApiError::QuotaExceeded
-            | ApiError::UsageNotIncluded
-            | ApiError::Retryable { .. }
-            | ApiError::RateLimit(_)
-            | ApiError::InvalidRequest { .. },
-        ) => Ok(()),
-    }
-}
-
-fn build_custom_provider_edits(config: &CustomProviderConfig) -> Vec<ConfigEdit> {
-    let provider_path = vec!["model_providers".to_string(), config.provider_id.clone()];
-
-    vec![
-        ConfigEdit::ClearPath {
-            segments: provider_path,
-        },
-        ConfigEdit::SetPath {
-            segments: vec!["model_provider".to_string()],
-            value: value(config.provider_id.clone()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec!["model".to_string()],
-            value: value(config.model.clone()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec![
-                "model_providers".to_string(),
-                config.provider_id.clone(),
-                "name".to_string(),
-            ],
-            value: value(config.provider_id.clone()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec![
-                "model_providers".to_string(),
-                config.provider_id.clone(),
-                "base_url".to_string(),
-            ],
-            value: value(config.base_url.clone()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec![
-                "model_providers".to_string(),
-                config.provider_id.clone(),
-                "wire_api".to_string(),
-            ],
-            value: value(config.wire_api.as_config_value()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec![
-                "model_providers".to_string(),
-                config.provider_id.clone(),
-                "experimental_bearer_token".to_string(),
-            ],
-            value: value(config.api_key.clone()),
-        },
-        ConfigEdit::SetPath {
-            segments: vec![
-                "model_providers".to_string(),
-                config.provider_id.clone(),
-                "requires_openai_auth".to_string(),
-            ],
-            value: value(false),
-        },
-    ]
-}
-
 fn mask_secret(value: &str) -> String {
     if value.is_empty() {
         "<not set>".to_string()
@@ -1322,8 +963,11 @@ mod tests {
     use ratatui::layout::Rect;
     use tempfile::TempDir;
 
+    use crate::provider_config::build_custom_provider_edits;
+    use crate::provider_config::validate_provider_id;
     use codex_core::auth::AuthCredentialsStoreMode;
     use codex_core::config::CONFIG_TOML_FILE;
+    use codex_core::config::edit::ConfigEditsBuilder;
 
     fn widget_forced_chatgpt() -> (AuthModeWidget, TempDir) {
         let codex_home = TempDir::new().unwrap();
@@ -1516,6 +1160,10 @@ base_url = "https://example.com/v1"
 wire_api = "responses"
 experimental_bearer_token = "sk-test"
 requires_openai_auth = false
+
+[profiles."_provider.custom_1.gpt-test"]
+model_provider = "custom_1"
+model = "gpt-test"
 "#
         );
     }

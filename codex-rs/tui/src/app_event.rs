@@ -20,6 +20,7 @@ use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::history_cell::HistoryCell;
+use crate::provider_config::CustomProviderConfig;
 
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
@@ -138,6 +139,9 @@ pub(crate) enum AppEvent {
     PersistPersonalitySelection {
         personality: Personality,
     },
+
+    /// Update in-memory config after saving a custom provider and model.
+    CustomProviderConfigured(CustomProviderConfig),
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {

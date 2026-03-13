@@ -1,3 +1,4 @@
+use crate::ModelProviderInfo;
 use crate::agent::AgentStatus;
 use crate::codex::Codex;
 use crate::error::Result as CodexResult;
@@ -72,5 +73,20 @@ impl CodexThread {
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
+    }
+
+    pub async fn update_model_provider(&self, provider: ModelProviderInfo) {
+        self.codex.update_model_provider(provider).await;
+    }
+
+    pub async fn switch_provider_and_model(
+        &self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        self.codex
+            .switch_provider_and_model(model_provider_id, provider, model)
+            .await;
     }
 }

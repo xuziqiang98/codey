@@ -61,6 +61,7 @@ mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod prompt_args;
+pub(crate) mod provider_config_view;
 mod skill_popup;
 mod skills_toggle_view;
 mod slash_commands;
@@ -645,6 +646,13 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    pub(crate) fn dismiss_active_view(&mut self) {
+        if self.view_stack.pop().is_some() {
+            self.on_active_view_complete();
+            self.request_redraw();
+        }
     }
 
     /// Called when the agent requests user approval.

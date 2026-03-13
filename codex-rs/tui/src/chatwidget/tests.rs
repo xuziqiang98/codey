@@ -22,6 +22,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
@@ -94,11 +95,16 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
 
+use crate::provider_config::CustomProviderConfig;
+use crate::provider_config::build_custom_provider_edits;
+
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
-    let codex_home = std::env::temp_dir();
+    let codex_home = tempdir().expect("tempdir");
+    let codex_home_path = codex_home.path().to_path_buf();
+    std::mem::forget(codex_home);
     ConfigBuilder::default()
-        .codex_home(codex_home.clone())
+        .codex_home(codex_home_path)
         .build()
         .await
         .expect("config")
@@ -590,8 +596,8 @@ async fn review_restores_context_window_indicator() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
     let context_window = 13_000;
-    let pre_review_tokens = 12_700; // ~30% remaining after subtracting baseline.
-    let review_tokens = 12_030; // ~97% remaining after subtracting baseline.
+    let pre_review_tokens = 12_700; // ~2% remaining in the real context window.
+    let review_tokens = 12_030; // ~7% remaining in the real context window.
 
     chat.handle_codex_event(Event {
         id: "token-before".into(),
@@ -600,7 +606,7 @@ async fn review_restores_context_window_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(2));
 
     chat.handle_codex_event(Event {
         id: "review-start".into(),
@@ -619,7 +625,7 @@ async fn review_restores_context_window_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(97));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(7));
 
     chat.handle_codex_event(Event {
         id: "review-end".into(),
@@ -629,7 +635,7 @@ async fn review_restores_context_window_indicator() {
     });
     let _ = drain_insert_history(&mut rx);
 
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(2));
     assert!(!chat.is_review_mode);
 }
 
@@ -648,7 +654,7 @@ async fn token_count_none_resets_context_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(2));
 
     chat.handle_codex_event(Event {
         id: "token-cleared".into(),
@@ -693,6 +699,21 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         chat.bottom_pane.context_window_used_tokens(),
         Some(total_tokens)
     );
+}
+
+#[tokio::test]
+async fn context_indicator_uses_real_remaining_percentage() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "token-usage".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(10_600, 30_400)),
+            rate_limits: None,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(65));
 }
 
 #[cfg_attr(
@@ -877,6 +898,31 @@ fn next_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> Op {
 fn set_chatgpt_auth(chat: &mut ChatWidget) {
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+        chat.config.model_provider_id.as_str(),
+        chat.config.model_provider.clone(),
+    ));
+}
+
+async fn reload_chat_config_with_saved_providers(
+    chat: &mut ChatWidget,
+    configs: Vec<CustomProviderConfig>,
+) {
+    for config in configs {
+        ConfigEditsBuilder::new(&chat.config.codex_home)
+            .with_edits(build_custom_provider_edits(&config))
+            .apply()
+            .await
+            .expect("persist provider config");
+    }
+
+    chat.config = ConfigBuilder::default()
+        .codex_home(chat.config.codex_home.clone())
+        .build()
+        .await
+        .expect("reload config");
     chat.models_manager = Arc::new(ModelsManager::new(
         chat.config.codex_home.clone(),
         chat.auth_manager.clone(),
@@ -3028,6 +3074,7 @@ async fn experimental_features_toggle_saves_on_exit() {
 async fn model_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
     chat.open_model_popup();
 
     let popup = render_bottom_popup(&chat, 80);
@@ -3096,7 +3143,17 @@ async fn model_picker_without_auth_shows_only_configured_custom_model() {
         chat.config.model_provider_id.as_str(),
         chat.config.model_provider.clone(),
     ));
-    chat.config.model_provider_id = "mock_provider".to_string();
+    reload_chat_config_with_saved_providers(
+        &mut chat,
+        vec![CustomProviderConfig {
+            provider_id: "mock_provider".to_string(),
+            wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+            base_url: "https://example.test/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "mock-model".to_string(),
+        }],
+    )
+    .await;
 
     chat.open_model_popup();
 
@@ -3108,6 +3165,111 @@ async fn model_picker_without_auth_shows_only_configured_custom_model() {
     assert!(
         !popup.contains("gpt-5.2-codex"),
         "expected built-in picker models to be hidden without auth:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_without_auth_shows_all_models_saved_in_config_toml() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.auth_manager = Arc::new(AuthManager::new(
+        chat.config.codex_home.clone(),
+        false,
+        AuthCredentialsStoreMode::File,
+    ));
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+        chat.config.model_provider_id.as_str(),
+        chat.config.model_provider.clone(),
+    ));
+    reload_chat_config_with_saved_providers(
+        &mut chat,
+        vec![
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "mock-model".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "deepseek-r1".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "other_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "claude-sonnet".to_string(),
+            },
+        ],
+    )
+    .await;
+    chat.set_model("mock-model");
+
+    chat.open_model_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("mock-model"),
+        "expected configured custom model to appear in picker:\n{popup}"
+    );
+    assert!(
+        popup.contains("deepseek-r1"),
+        "expected saved model to appear in picker:\n{popup}"
+    );
+    assert!(
+        popup.contains("claude-sonnet"),
+        "expected models from other providers in config.toml to appear in picker:\n{popup}"
+    );
+    assert!(
+        !popup.contains("gpt-5.2-codex"),
+        "expected built-in picker models to be hidden without auth:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_with_chatgpt_auth_shows_full_list_and_config_models() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("mock-model")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
+    reload_chat_config_with_saved_providers(
+        &mut chat,
+        vec![
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "mock-model".to_string(),
+            },
+            CustomProviderConfig {
+                provider_id: "mock_provider".to_string(),
+                wire_api: crate::provider_config::ApiProviderWireApi::Responses,
+                base_url: "https://example.test/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "deepseek-r1".to_string(),
+            },
+        ],
+    )
+    .await;
+    chat.set_model("mock-model");
+
+    chat.open_model_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("gpt-5.2-codex"),
+        "expected the full built-in model list with ChatGPT auth:\n{popup}"
+    );
+    assert!(
+        popup.contains("deepseek-r1"),
+        "expected configured models to remain visible with ChatGPT auth:\n{popup}"
     );
 }
 
@@ -3346,10 +3508,55 @@ async fn single_reasoning_option_skips_selection() {
     }
 
     assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            AppEvent::PersistModelSelection { model, effort }
+                if model == "model-with-single-reasoning"
+                    && *effort == Some(ReasoningEffortConfig::High)
+        )),
+        "expected single reasoning option to persist model selection automatically; events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_with_no_reasoning_options_dismisses_after_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let preset = ModelPreset {
+        id: "custom-model".to_string(),
+        model: "custom-model".to_string(),
+        display_name: "custom-model".to_string(),
+        description: "Configured model from config.toml.".to_string(),
+        default_reasoning_effort: ReasoningEffortConfig::Medium,
+        supported_reasoning_efforts: Vec::new(),
+        supports_personality: false,
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    };
+    chat.open_all_models_popup(vec![preset]);
+
+    let before = render_bottom_popup(&chat, 80);
+    assert!(
+        before.contains("Select Model and Effort"),
+        "expected model picker to be open; popup: {before}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let after = render_bottom_popup(&chat, 80);
+    assert!(
+        !after.contains("Select Model and Effort"),
+        "expected model picker to dismiss after selecting a model with no reasoning options; popup: {after}"
+    );
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
         events
             .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
-        "expected reasoning effort to be applied automatically; events: {events:?}"
+            .any(|ev| matches!(ev, AppEvent::OpenReasoningPopup { model } if model.model == "custom-model")),
+        "expected custom model selection to continue through the reasoning handler; events: {events:?}"
     );
 }
 
@@ -3379,6 +3586,7 @@ async fn feedback_upload_consent_popup_snapshot() {
 async fn reasoning_popup_escape_returns_to_model_popup() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
     chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth(&mut chat);
     chat.open_model_popup();
 
     let preset = get_available_model(&chat, "gpt-5.1-codex-max");
@@ -3464,6 +3672,36 @@ async fn disabled_slash_command_while_task_running_snapshot() {
     );
     let blob = lines_to_single_string(cells.last().unwrap());
     assert_snapshot!(blob);
+}
+
+#[tokio::test]
+async fn providers_command_opens_provider_wizard() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Providers);
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("Configure a custom API provider"),
+        "expected provider wizard to be shown:\n{popup}"
+    );
+    assert!(
+        popup.contains("Step 1/5: Provider ID"),
+        "expected provider wizard to start on provider id:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn providers_command_is_disabled_while_task_running() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command(SlashCommand::Providers);
+
+    let cells = drain_insert_history(&mut rx);
+    let blob = lines_to_single_string(cells.last().expect("error message cell"));
+    assert!(blob.contains("'/providers' is disabled while a task is in progress."));
+    assert!(!render_bottom_popup(&chat, 80).contains("Configure a custom API provider"));
 }
 
 #[tokio::test]

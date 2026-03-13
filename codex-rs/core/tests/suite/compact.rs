@@ -157,6 +157,21 @@ fn chat_sse_delta_and_stop(text: &str) -> String {
     )
 }
 
+fn chat_sse_delta_and_stop_with_tokens(text: &str, total_tokens: i64) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&json!({
+            "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": total_tokens,
+                "completion_tokens": 0,
+                "total_tokens": total_tokens
+            }
+        }))
+        .expect("serialize chat stop response with usage")
+    )
+}
+
 fn chat_sse_length() -> String {
     format!(
         "data: {}\n\ndata: [DONE]\n\n",
@@ -2736,44 +2751,36 @@ async fn unknown_chat_model_upgrades_context_window_after_large_success() {
         _ => None,
     })
     .await;
-    assert_eq!(model_context_window, Some(121_600));
+    assert_eq!(model_context_window, Some(60_800));
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_chat_model_context_limit_compacts_and_retries() {
+async fn unknown_chat_model_upgrades_context_window_from_response_usage() {
     skip_if_no_network!();
-
-    enum TerminalEvent {
-        TurnComplete,
-        Error(String),
-    }
 
     let server = MockServer::start().await;
     let chat_seq = ChatSeqResponder {
         num_calls: AtomicUsize::new(0),
         bodies: vec![
-            chat_sse_length(),
-            chat_sse_delta_and_stop(AUTO_SUMMARY_TEXT),
-            chat_sse_delta_and_stop(FINAL_REPLY),
+            chat_sse_delta_and_stop_with_tokens("first reply", 40_000),
+            chat_sse_delta_and_stop("second reply"),
         ],
     };
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(chat_seq)
-        .expect(3)
+        .expect(2)
         .mount(&server)
         .await;
 
     let model_provider = unknown_chat_model_provider(&server);
-    let large_input = "b".repeat(140_000);
 
     let codex = test_codex()
         .with_config(move |config| {
             config.model = Some("unknown-chat-model".to_string());
             config.model_provider = model_provider;
-            set_test_compact_prompt(config);
         })
         .build(&server)
         .await
@@ -2783,24 +2790,110 @@ async fn unknown_chat_model_context_limit_compacts_and_retries() {
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: large_input.clone(),
+                text: "small request".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
         })
         .await
-        .expect("submit large turn");
+        .expect("submit initial turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let terminal = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::TurnComplete(_) => Some(TerminalEvent::TurnComplete),
-        EventMsg::Error(err) => Some(TerminalEvent::Error(err.message.clone())),
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "follow up".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit follow-up turn");
+
+    let model_context_window = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::TurnStarted(event) => Some(event.model_context_window),
         _ => None,
     })
     .await;
-    match terminal {
-        TerminalEvent::TurnComplete => {}
-        TerminalEvent::Error(message) => panic!("unexpected error event: {message}"),
-    }
+    assert_eq!(model_context_window, Some(60_800));
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_chat_model_adjacent_probe_failure_persists_learned_window() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let chat_seq = ChatSeqResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies: vec![
+            chat_sse_delta_and_stop(FINAL_REPLY),
+            chat_sse_length(),
+            chat_sse_delta_and_stop(AUTO_SUMMARY_TEXT),
+            chat_sse_delta_and_stop(FINAL_REPLY),
+            chat_sse_delta_and_stop(AUTO_SUMMARY_TEXT),
+            chat_sse_delta_and_stop(FINAL_REPLY),
+        ],
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(chat_seq)
+        .expect(6)
+        .mount(&server)
+        .await;
+
+    let model_provider = unknown_chat_model_provider(&server);
+    let first_probe_input = "b".repeat(40_000);
+    let second_probe_input = "c".repeat(80_000);
+    let locked_follow_up_input = "d".repeat(40_000);
+
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model = Some("unknown-chat-model".to_string());
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+    let codex = test.codex.clone();
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: first_probe_input.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit first probe turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: second_probe_input.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit second probe turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: locked_follow_up_input.clone(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit locked follow-up turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = server.received_requests().await.expect("capture requests");
     let chat_requests = requests
@@ -2809,19 +2902,66 @@ async fn unknown_chat_model_context_limit_compacts_and_retries() {
         .collect::<Vec<_>>();
     assert_eq!(
         chat_requests.len(),
-        3,
-        "expected initial, compact, and retry requests"
+        6,
+        "expected one successful probe, one failed adjacent probe with compact retry, then preflight compact after locking"
     );
 
-    let compact_body = String::from_utf8_lossy(&chat_requests[1].body);
+    let first_probe_body = String::from_utf8_lossy(&chat_requests[0].body);
+    assert!(
+        body_contains_text(&first_probe_body, &first_probe_input),
+        "first request should probe optimistically at the initial step"
+    );
+    assert!(
+        !body_contains_text(&first_probe_body, SUMMARIZATION_PROMPT),
+        "first request should not preflight compact"
+    );
+
+    let second_probe_body = String::from_utf8_lossy(&chat_requests[1].body);
+    assert!(
+        body_contains_text(&second_probe_body, &second_probe_input),
+        "second request should probe the adjacent next step"
+    );
+    assert!(
+        !body_contains_text(&second_probe_body, SUMMARIZATION_PROMPT),
+        "second request should still be sent before compacting"
+    );
+
+    let compact_body = String::from_utf8_lossy(&chat_requests[2].body);
     assert!(
         body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
-        "compact request should include the summarization prompt"
+        "failed adjacent probe should trigger compaction"
     );
 
-    let retry_body = String::from_utf8_lossy(&chat_requests[2].body);
+    let retry_body = String::from_utf8_lossy(&chat_requests[3].body);
     assert!(
         body_contains_text(&retry_body, AUTO_SUMMARY_TEXT),
         "retry request should include the compacted summary"
     );
+
+    let second_compact_body = String::from_utf8_lossy(&chat_requests[4].body);
+    assert!(
+        body_contains_text(&second_compact_body, SUMMARIZATION_PROMPT),
+        "future large turns should preflight compact after the learned window is locked"
+    );
+    assert!(
+        body_contains_text(&second_compact_body, &locked_follow_up_input),
+        "preflight compact should include the follow-up input once the learned window is known"
+    );
+
+    let second_retry_body = String::from_utf8_lossy(&chat_requests[5].body);
+    assert!(
+        body_contains_text(&second_retry_body, AUTO_SUMMARY_TEXT),
+        "post-preflight retry should include the compacted summary"
+    );
+
+    let raw_config = tokio::fs::read_to_string(test.codex_home_path().join("config.toml"))
+        .await
+        .expect("read config.toml");
+    let config_toml: codex_core::config::ConfigToml =
+        toml::from_str(&raw_config).expect("parse config.toml");
+    let profile = config_toml
+        .profiles
+        .get("_provider.openai.unknown-chat-model")
+        .expect("generated provider-profile");
+    assert_eq!(profile.model_context_window, Some(32_000));
 }

@@ -7,7 +7,7 @@
 
 ### Building
 ```
-cd codex-rs && cargo build -p codex-cli --bin codey
+cd codex-rs && cargo build -p codex-cli --bin codey --release
 
 export PATH="<codey binary path>:$PATH" >> ~/.bashrc
 ```

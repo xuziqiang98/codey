@@ -156,6 +156,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::bottom_pane::provider_config_view::ProviderConfigView;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::collab;
 use crate::collaboration_modes;
@@ -2834,6 +2835,9 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Providers => {
+                self.open_provider_popup();
+            }
             SlashCommand::Personality => {
                 self.open_personality_popup();
             }
@@ -3851,19 +3855,29 @@ impl ChatWidget {
             return;
         }
 
-        let presets: Vec<ModelPreset> =
-            match self.models_manager.try_list_picker_models(&self.config) {
-                Ok(models) => models,
-                Err(_) => {
-                    self.add_info_message(
-                        "Models are being updated; please try /model again in a moment."
-                            .to_string(),
-                        None,
-                    );
-                    return;
-                }
-            };
+        let presets: Vec<ModelPreset> = match self
+            .models_manager
+            .try_list_model_switcher_models(&self.config)
+        {
+            Ok(models) => models,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try /model again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
         self.open_model_popup_with_presets(presets);
+    }
+
+    pub(crate) fn open_provider_popup(&mut self) {
+        self.bottom_pane.show_view(Box::new(ProviderConfigView::new(
+            self.config.codex_home.clone(),
+            self.app_event_tx.clone(),
+            self.frame_requester.clone(),
+        )));
+        self.request_redraw();
     }
 
     pub(crate) fn open_personality_popup(&mut self) {
@@ -4082,7 +4096,7 @@ impl ChatWidget {
             let description =
                 (!preset.description.is_empty()).then_some(preset.description.to_string());
             let is_current = preset.model.as_str() == self.current_model();
-            let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
+            let requires_reasoning_picker = preset.supported_reasoning_efforts.len() > 1;
             let preset_for_action = preset.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 let preset_for_event = preset_for_action.clone();
@@ -4096,7 +4110,7 @@ impl ChatWidget {
                 is_current,
                 is_default: preset.is_default,
                 actions,
-                dismiss_on_select: single_supported_effort,
+                dismiss_on_select: !requires_reasoning_picker,
                 ..Default::default()
             });
         }
@@ -4166,19 +4180,6 @@ impl ChatWidget {
             let effort_label = effort_for_action
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "default".to_string());
-            tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: Some(model_for_action.clone()),
-                effort: Some(effort_for_action),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-            }));
-            tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort_for_action));
             tx.send(AppEvent::PersistModelSelection {
                 model: model_for_action.clone(),
                 effort: effort_for_action,
@@ -4339,21 +4340,6 @@ impl ChatWidget {
     }
 
     fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
-        self.app_event_tx
-            .send(AppEvent::CodexOp(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: Some(model.clone()),
-                effort: Some(effort),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-            }));
-        self.app_event_tx.send(AppEvent::UpdateModel(model.clone()));
-        self.app_event_tx
-            .send(AppEvent::UpdateReasoningEffort(effort));
         self.app_event_tx.send(AppEvent::PersistModelSelection {
             model: model.clone(),
             effort,
@@ -5187,6 +5173,22 @@ impl ChatWidget {
     /// Set the personality in the widget's config copy.
     pub(crate) fn set_personality(&mut self, personality: Personality) {
         self.config.personality = Some(personality);
+    }
+
+    pub(crate) fn sync_provider_config(&mut self, config: &Config, update_active_provider: bool) {
+        self.config.config_layer_stack = config.config_layer_stack.clone();
+        self.config.model = config.model.clone();
+        self.config.model_providers = config.model_providers.clone();
+        if update_active_provider {
+            self.config.model_provider_id = config.model_provider_id.clone();
+            self.config.model_provider = config.model_provider.clone();
+        }
+        self.request_redraw();
+    }
+
+    pub(crate) fn dismiss_active_view(&mut self) {
+        self.bottom_pane.dismiss_active_view();
+        self.request_redraw();
     }
 
     /// Set the model in the widget's config copy and stored collaboration mode.

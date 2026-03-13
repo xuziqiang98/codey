@@ -84,6 +84,7 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use toml_edit::value;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
@@ -105,6 +106,9 @@ use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
 use crate::config::GhostSnapshotConfig;
+use crate::config::edit::ConfigEdit;
+use crate::config::edit::ConfigEditsBuilder;
+use crate::config::generated_provider_profile_name;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::config::types::McpServerConfig;
 use crate::config::types::ShellEnvironmentPolicy;
@@ -429,6 +433,21 @@ impl Codex {
         state.session_configuration.thread_config_snapshot()
     }
 
+    pub(crate) async fn update_model_provider(&self, provider: ModelProviderInfo) {
+        self.session.update_model_provider(provider).await;
+    }
+
+    pub(crate) async fn switch_provider_and_model(
+        &self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        self.session
+            .switch_provider_and_model(model_provider_id, provider, model)
+            .await;
+    }
+
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.session.state_db()
     }
@@ -559,6 +578,47 @@ impl SessionConfiguration {
         }
     }
 
+    fn update_model_provider(&mut self, provider: ModelProviderInfo) {
+        self.provider = provider.clone();
+
+        let mut config = (*self.original_config_do_not_use).clone();
+        config.model_provider = provider.clone();
+        config
+            .model_providers
+            .insert(config.model_provider_id.clone(), provider);
+        self.original_config_do_not_use = Arc::new(config);
+    }
+
+    fn switch_provider_and_model(
+        &mut self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        self.provider = provider.clone();
+        self.collaboration_mode =
+            self.collaboration_mode
+                .with_updates(Some(model.clone()), None, None);
+
+        let mut config = (*self.original_config_do_not_use).clone();
+        config.model_provider_id = model_provider_id.clone();
+        config.model_provider = provider.clone();
+        config.model = Some(model);
+        config.model_providers.insert(model_provider_id, provider);
+        self.original_config_do_not_use = Arc::new(config);
+    }
+
+    fn set_learned_model_context_window(
+        &mut self,
+        context_window: i64,
+        auto_compact_token_limit: i64,
+    ) {
+        let mut config = (*self.original_config_do_not_use).clone();
+        config.model_context_window = Some(context_window);
+        config.model_auto_compact_token_limit = Some(auto_compact_token_limit);
+        self.original_config_do_not_use = Arc::new(config);
+    }
+
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
@@ -604,6 +664,11 @@ impl Session {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
+        per_turn_config.model_provider = session_configuration.provider.clone();
+        per_turn_config.model_providers.insert(
+            per_turn_config.model_provider_id.clone(),
+            session_configuration.provider.clone(),
+        );
         per_turn_config.model_reasoning_effort =
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
@@ -638,6 +703,36 @@ impl Session {
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
+    }
+
+    pub(crate) async fn update_model_provider(&self, provider: ModelProviderInfo) {
+        {
+            let mut state = self.state.lock().await;
+            state
+                .session_configuration
+                .update_model_provider(provider.clone());
+        }
+        self.services.models_manager.set_provider(provider);
+    }
+
+    pub(crate) async fn switch_provider_and_model(
+        &self,
+        model_provider_id: String,
+        provider: ModelProviderInfo,
+        model: String,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            state.session_configuration.switch_provider_and_model(
+                model_provider_id.clone(),
+                provider.clone(),
+                model,
+            );
+        }
+        self.services
+            .models_manager
+            .switch_provider(model_provider_id.as_str(), provider)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1982,8 +2077,8 @@ impl Session {
                 total_tokens: estimated_total_tokens.max(0),
             };
 
-            if info.model_context_window.is_none() {
-                info.model_context_window = turn_context.client.get_model_context_window();
+            if let Some(context_window) = turn_context.client.get_model_context_window() {
+                info.model_context_window = Some(context_window);
             }
 
             state.set_token_info(Some(info));
@@ -3280,7 +3375,23 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if total_usage_tokens >= auto_compact_limit(turn_context.as_ref()) {
+    let should_defer_auto_compact = turn_context
+        .client
+        .should_defer_auto_compact_until_after_dynamic_probe();
+    let compact_limit = auto_compact_limit(turn_context.as_ref());
+    if let Some(status) = turn_context.client.dynamic_context_window_status() {
+        debug!(
+            model = %turn_context.client.get_model(),
+            provider = %turn_context.client.get_provider().name,
+            dynamic_locked = status.locked,
+            dynamic_window = status.current_context_window,
+            effective_window_limit = compact_limit,
+            current_context_pressure = total_usage_tokens,
+            should_defer_auto_compact,
+            decision = "turn_start_auto_compact_check",
+        );
+    }
+    if !should_defer_auto_compact && total_usage_tokens >= compact_limit {
         run_auto_compact(&sess, &turn_context).await;
     }
 
@@ -3430,22 +3541,68 @@ pub(crate) async fn run_turn(
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                     request_input_tokens,
+                    response_total_tokens,
                     tool_output_tokens,
                 } = sampling_request_output;
-                if let Some(input_tokens) = request_input_tokens {
-                    let _ = turn_context
+                let effective_prompt_pressure = effective_prompt_pressure(
+                    request_input_tokens,
+                    response_total_tokens,
+                    tool_output_tokens,
+                    needs_follow_up,
+                );
+                if let Some(prompt_pressure) = effective_prompt_pressure {
+                    let success = turn_context
                         .client
-                        .maybe_upgrade_dynamic_context_window(input_tokens);
+                        .record_dynamic_context_window_success(prompt_pressure);
+                    if let Some(status) = turn_context.client.dynamic_context_window_status() {
+                        debug!(
+                            model = %turn_context.client.get_model(),
+                            provider = %turn_context.client.get_provider().name,
+                            dynamic_locked = status.locked,
+                            dynamic_window = status.current_context_window,
+                            effective_window_limit = auto_compact_limit(turn_context.as_ref()),
+                            request_input_tokens,
+                            response_total_tokens,
+                            tool_output_tokens,
+                            needs_follow_up,
+                            effective_prompt_pressure = prompt_pressure,
+                            decision = "dynamic_context_window_success_check",
+                        );
+                    }
+                    if let Some(success) = success
+                        && success.learned
+                    {
+                        learn_dynamic_context_window(&sess, &turn_context, success.context_window)
+                            .await;
+                    }
                 }
-                let total_usage_tokens = if needs_follow_up {
-                    sess.get_total_token_usage()
-                        .await
-                        .saturating_add(tool_output_tokens)
+                let total_usage_tokens = if let Some(prompt_pressure) = effective_prompt_pressure {
+                    prompt_pressure
                 } else {
-                    sess.get_total_token_usage().await
+                    let current_context_tokens = sess.get_total_token_usage().await;
+                    if needs_follow_up {
+                        current_context_tokens.saturating_add(tool_output_tokens)
+                    } else {
+                        current_context_tokens
+                    }
                 };
-                let token_limit_reached =
-                    total_usage_tokens >= auto_compact_limit(turn_context.as_ref());
+                let compact_limit = auto_compact_limit(turn_context.as_ref());
+                let token_limit_reached = total_usage_tokens >= compact_limit;
+                if let Some(status) = turn_context.client.dynamic_context_window_status() {
+                    debug!(
+                        model = %turn_context.client.get_model(),
+                        provider = %turn_context.client.get_provider().name,
+                        dynamic_locked = status.locked,
+                        dynamic_window = status.current_context_window,
+                        effective_window_limit = compact_limit,
+                        request_input_tokens,
+                        response_total_tokens,
+                        tool_output_tokens,
+                        needs_follow_up,
+                        effective_prompt_pressure = total_usage_tokens,
+                        decision = "post_response_compact_check",
+                    );
+                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
@@ -3472,12 +3629,34 @@ pub(crate) async fn run_turn(
             }) => {
                 has_sent_sampling_request = true;
                 preflight_compaction_attempted = false;
-                let should_retry = request_input_tokens.is_some_and(|input_tokens| {
+                let probe_failure = request_input_tokens.map(|input_tokens| {
                     turn_context
                         .client
-                        .record_dynamic_context_window_retry(&turn_context.sub_id, input_tokens)
+                        .record_dynamic_context_window_probe_failure(
+                            &turn_context.sub_id,
+                            input_tokens,
+                        )
                 });
-                if should_retry {
+                if let Some(learned_context_window) = probe_failure
+                    .as_ref()
+                    .and_then(|failure| failure.learned_context_window)
+                {
+                    learn_dynamic_context_window(&sess, &turn_context, learned_context_window)
+                        .await;
+                }
+                if let Some(status) = turn_context.client.dynamic_context_window_status() {
+                    debug!(
+                        model = %turn_context.client.get_model(),
+                        provider = %turn_context.client.get_provider().name,
+                        dynamic_locked = status.locked,
+                        dynamic_window = status.current_context_window,
+                        effective_window_limit = auto_compact_limit(turn_context.as_ref()),
+                        request_input_tokens,
+                        decision = "dynamic_context_window_probe_failure",
+                        should_retry = probe_failure.is_some_and(|failure| failure.should_retry),
+                    );
+                }
+                if probe_failure.is_some_and(|failure| failure.should_retry) {
                     run_auto_compact(&sess, &turn_context).await;
                     continue;
                 }
@@ -3530,6 +3709,13 @@ pub(crate) async fn run_turn(
 }
 
 fn auto_compact_limit(turn_context: &TurnContext) -> i64 {
+    if let Some(context_window) = turn_context
+        .client
+        .dynamic_context_window_auto_compact_limit()
+    {
+        return context_window;
+    }
+
     turn_context
         .client
         .get_model_info()
@@ -3537,13 +3723,50 @@ fn auto_compact_limit(turn_context: &TurnContext) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+fn effective_prompt_pressure(
+    request_input_tokens: Option<i64>,
+    response_total_tokens: Option<i64>,
+    tool_output_tokens: i64,
+    needs_follow_up: bool,
+) -> Option<i64> {
+    let base = response_total_tokens.or(request_input_tokens)?;
+    Some(if needs_follow_up {
+        base.saturating_add(tool_output_tokens)
+    } else {
+        base
+    })
+}
+
 fn should_preflight_compact(turn_context: &TurnContext, request_input_tokens: Option<i64>) -> bool {
-    request_input_tokens.is_some_and(|input_tokens| {
+    let decision = request_input_tokens.is_some_and(|input_tokens| {
+        if turn_context
+            .client
+            .dynamic_context_window_auto_compact_limit()
+            .is_some()
+        {
+            return turn_context
+                .client
+                .should_preflight_dynamic_context_window_compact(input_tokens);
+        }
+
         turn_context
             .client
             .get_model_context_window()
             .is_some_and(|context_window| input_tokens >= context_window)
-    })
+    });
+    if let Some(status) = turn_context.client.dynamic_context_window_status() {
+        debug!(
+            model = %turn_context.client.get_model(),
+            provider = %turn_context.client.get_provider().name,
+            dynamic_locked = status.locked,
+            dynamic_window = status.current_context_window,
+            effective_window_limit = auto_compact_limit(turn_context),
+            request_input_tokens,
+            decision = "preflight_compact_check",
+            should_compact = decision,
+        );
+    }
+    decision
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
@@ -3551,6 +3774,77 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) 
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+    }
+}
+
+async fn learn_dynamic_context_window(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    context_window: i64,
+) {
+    let Some(auto_compact_token_limit) = turn_context.client.get_model_context_window() else {
+        return;
+    };
+
+    let (codex_home, active_profile, model_provider_id, model) = {
+        let mut state = sess.state.lock().await;
+        state
+            .session_configuration
+            .set_learned_model_context_window(context_window, auto_compact_token_limit);
+        (
+            state.session_configuration.codex_home().clone(),
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .active_profile
+                .clone(),
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .model_provider_id
+                .clone(),
+            state
+                .session_configuration
+                .collaboration_mode
+                .model()
+                .to_string(),
+        )
+    };
+
+    let write_generated_profile = active_profile.is_none();
+    let profile = active_profile.unwrap_or_else(|| {
+        generated_provider_profile_name(model_provider_id.as_str(), model.as_str())
+    });
+    let mut edits = vec![ConfigEdit::SetPath {
+        segments: vec!["model_context_window".to_string()],
+        value: value(context_window),
+    }];
+
+    if write_generated_profile {
+        edits.push(ConfigEdit::SetPath {
+            segments: vec!["model".to_string()],
+            value: value(model.clone()),
+        });
+        edits.push(ConfigEdit::SetPath {
+            segments: vec!["model_provider".to_string()],
+            value: value(model_provider_id),
+        });
+    }
+
+    if let Err(err) = ConfigEditsBuilder::new(codex_home.as_path())
+        .with_profile(Some(profile.as_str()))
+        .with_edits(edits)
+        .apply()
+        .await
+    {
+        warn!("failed to persist learned model_context_window: {err}");
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: format!("Failed to persist learned context window for `{model}`: {err}"),
+            }),
+        )
+        .await;
     }
 }
 
@@ -3826,6 +4120,7 @@ struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
     request_input_tokens: Option<i64>,
+    response_total_tokens: Option<i64>,
     tool_output_tokens: i64,
 }
 
@@ -4427,6 +4722,7 @@ async fn try_run_sampling_request(
                     needs_follow_up,
                     last_agent_message,
                     request_input_tokens: None,
+                    response_total_tokens: token_usage.as_ref().map(|usage| usage.total_tokens),
                     tool_output_tokens: 0,
                 });
             }
@@ -4912,7 +5208,7 @@ mod tests {
             .client
             .get_model_context_window()
             .expect("dynamic context window");
-        assert!(should_preflight_compact(
+        assert!(!should_preflight_compact(
             &turn_context,
             Some(context_window)
         ));
@@ -4923,7 +5219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_context_window_requires_verified_upgrade_before_skipping_preflight_compact() {
+    async fn dynamic_context_window_preflights_after_probe_failure() {
         let (session, mut turn_context) = make_session_and_context().await;
         let mut model_info = turn_context.client.get_model_info();
         model_info.context_window = None;
@@ -4945,19 +5241,25 @@ mod tests {
         );
 
         let upgradeable_input_tokens = 100_000;
-        assert!(should_preflight_compact(
+        assert!(!should_preflight_compact(
             &turn_context,
             Some(upgradeable_input_tokens)
         ));
 
         let _ = turn_context
             .client
-            .maybe_upgrade_dynamic_context_window(upgradeable_input_tokens);
-        assert!(!should_preflight_compact(
+            .record_dynamic_context_window_probe_failure(
+                &turn_context.sub_id,
+                upgradeable_input_tokens,
+            );
+        assert!(should_preflight_compact(
             &turn_context,
             Some(upgradeable_input_tokens)
         ));
+    }
 
+    #[tokio::test]
+    async fn dynamic_context_window_locks_after_adjacent_probe_failure() {
         let (session, mut turn_context) = make_session_and_context().await;
         let mut model_info = turn_context.client.get_model_info();
         model_info.context_window = None;
@@ -4978,14 +5280,136 @@ mod tests {
             turn_context.client.transport_manager(),
         );
 
-        let over_limit_input_tokens = 140_000;
+        let first_probe = 40_000;
+        assert!(!should_preflight_compact(&turn_context, Some(first_probe)));
+
         let _ = turn_context
             .client
-            .maybe_upgrade_dynamic_context_window(over_limit_input_tokens);
-        assert!(should_preflight_compact(
-            &turn_context,
-            Some(over_limit_input_tokens)
-        ));
+            .record_dynamic_context_window_success(first_probe);
+        let second_probe = 80_000;
+        let _ = turn_context
+            .client
+            .record_dynamic_context_window_probe_failure(&turn_context.sub_id, second_probe);
+        assert!(should_preflight_compact(&turn_context, Some(first_probe)));
+    }
+
+    #[tokio::test]
+    async fn dynamic_context_window_preflights_after_learning_max_step() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        let _ = turn_context
+            .client
+            .record_dynamic_context_window_success(40_000);
+        let _ = turn_context
+            .client
+            .record_dynamic_context_window_success(70_000);
+        let _ = turn_context
+            .client
+            .record_dynamic_context_window_success(130_000);
+        assert!(!should_preflight_compact(&turn_context, Some(190_001)));
+        let _ = turn_context
+            .client
+            .record_dynamic_context_window_success(190_001);
+        assert!(should_preflight_compact(&turn_context, Some(190_001)));
+    }
+
+    #[tokio::test]
+    async fn token_count_updates_context_window_after_dynamic_upgrade() {
+        let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+        let mut turn_context = Arc::into_inner(turn_context).expect("unique turn context");
+        let mut model_info = turn_context.client.get_model_info();
+        model_info.context_window = None;
+
+        turn_context.client = ModelClient::new_with_dynamic_context_window(
+            turn_context.client.config(),
+            turn_context.client.get_auth_manager(),
+            model_info,
+            Some(Arc::new(std::sync::Mutex::new(
+                DynamicContextWindowState::new(),
+            ))),
+            turn_context.client.get_otel_manager(),
+            turn_context.client.get_provider(),
+            turn_context.client.get_reasoning_effort(),
+            turn_context.client.get_reasoning_summary(),
+            session.conversation_id,
+            turn_context.client.get_session_source(),
+            turn_context.client.transport_manager(),
+        );
+
+        session
+            .update_token_usage_info(
+                &turn_context,
+                Some(&TokenUsage {
+                    total_tokens: 31_000,
+                    ..TokenUsage::default()
+                }),
+            )
+            .await;
+        let first = wait_for_token_count(&rx).await;
+        assert_eq!(
+            first.info.expect("first token info").model_context_window,
+            Some(30_400)
+        );
+
+        let success = turn_context
+            .client
+            .record_dynamic_context_window_success(31_000);
+        assert_eq!(
+            success
+                .expect("dynamic context window success")
+                .context_window,
+            64_000
+        );
+
+        session
+            .update_token_usage_info(
+                &turn_context,
+                Some(&TokenUsage {
+                    total_tokens: 40_000,
+                    ..TokenUsage::default()
+                }),
+            )
+            .await;
+        let second = wait_for_token_count(&rx).await;
+        assert_eq!(
+            second.info.expect("second token info").model_context_window,
+            Some(60_800)
+        );
+    }
+
+    #[test]
+    fn effective_prompt_pressure_prefers_response_usage_and_follow_up_tool_output() {
+        assert_eq!(
+            effective_prompt_pressure(Some(20_000), Some(35_000), 5_000, true),
+            Some(40_000)
+        );
+        assert_eq!(
+            effective_prompt_pressure(Some(20_000), Some(35_000), 5_000, false),
+            Some(35_000)
+        );
+        assert_eq!(
+            effective_prompt_pressure(Some(20_000), None, 5_000, true),
+            Some(25_000)
+        );
+        assert_eq!(effective_prompt_pressure(None, None, 5_000, true), None);
     }
 
     #[tokio::test]
@@ -5403,6 +5827,21 @@ mod tests {
         }
     }
 
+    async fn wait_for_token_count(rx: &async_channel::Receiver<Event>) -> TokenCountEvent {
+        let deadline = StdDuration::from_secs(2);
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let evt = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("timeout waiting for event")
+                .expect("event");
+            if let EventMsg::TokenCount(payload) = evt.msg {
+                return payload;
+            }
+        }
+    }
+
     async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) -> ErrorEvent {
         let deadline = StdDuration::from_secs(2);
         let start = std::time::Instant::now();
@@ -5700,6 +6139,80 @@ mod tests {
 
     fn mark_state_initial_context_seeded(state: &mut SessionState) {
         state.initial_context_seeded = true;
+    }
+
+    #[tokio::test]
+    async fn update_model_provider_refreshes_session_and_new_turns() {
+        let (session, turn_context) = make_session_and_context().await;
+        let mut provider = turn_context.client.get_provider();
+        provider.base_url = Some("https://example.com/v2".to_string());
+        provider.experimental_bearer_token = Some("sk-updated".to_string());
+        provider.wire_api = crate::WireApi::Chat;
+
+        session.update_model_provider(provider.clone()).await;
+
+        let config = session.get_config().await;
+        assert_eq!(config.model_provider, provider);
+        assert_eq!(
+            config
+                .model_providers
+                .get(config.model_provider_id.as_str()),
+            Some(&provider)
+        );
+
+        let turn_context = session
+            .new_default_turn_with_sub_id("updated-provider".to_string())
+            .await;
+        assert_eq!(turn_context.client.get_provider(), provider);
+        assert_eq!(turn_context.client.config().model_provider, provider);
+    }
+
+    #[tokio::test]
+    async fn switch_provider_and_model_refreshes_session_and_new_turns() {
+        let (session, turn_context) = make_session_and_context().await;
+        let mut provider = turn_context.client.get_provider();
+        provider.base_url = Some("https://example.com/v2".to_string());
+        provider.experimental_bearer_token = Some("sk-updated".to_string());
+        provider.wire_api = crate::WireApi::Chat;
+
+        session
+            .switch_provider_and_model(
+                "custom-provider".to_string(),
+                provider.clone(),
+                "custom-model".to_string(),
+            )
+            .await;
+
+        let config = session.get_config().await;
+        assert_eq!(config.model_provider_id, "custom-provider");
+        assert_eq!(config.model_provider, provider);
+        assert_eq!(config.model.as_deref(), Some("custom-model"));
+        assert_eq!(
+            config
+                .model_providers
+                .get(config.model_provider_id.as_str()),
+            Some(&config.model_provider)
+        );
+
+        let snapshot = {
+            let state = session.state.lock().await;
+            state.session_configuration.thread_config_snapshot()
+        };
+        assert_eq!(snapshot.model_provider_id, "custom-provider");
+        assert_eq!(snapshot.model, "custom-model");
+
+        let turn_context = session
+            .new_default_turn_with_sub_id("updated-provider-and-model".to_string())
+            .await;
+        assert_eq!(turn_context.client.get_provider(), provider);
+        assert_eq!(
+            turn_context.client.config().model_provider_id,
+            "custom-provider"
+        );
+        assert_eq!(
+            turn_context.client.config().model.as_deref(),
+            Some("custom-model")
+        );
     }
 
     #[tokio::test]

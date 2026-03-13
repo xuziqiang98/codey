@@ -8571,6 +8571,12 @@
             "null"
           ]
         },
+        "modelProvider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reasoningEffort": {
           "anyOf": [
             {
