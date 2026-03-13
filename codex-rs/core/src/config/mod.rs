@@ -37,6 +37,7 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_ID;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
+use crate::models_manager::model_info::find_model_info_for_slug;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
@@ -95,8 +96,13 @@ pub use codex_git::GhostSnapshotConfig;
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
+pub const GENERATED_PROVIDER_PROFILE_PREFIX: &str = "_provider.";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+
+pub fn generated_provider_profile_name(provider_id: &str, model: &str) -> String {
+    format!("{GENERATED_PROVIDER_PROFILE_PREFIX}{provider_id}.{model}")
+}
 
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {
@@ -1249,6 +1255,22 @@ impl ConfigToml {
             _ => Err(ResolveModelProviderError::ambiguous(model, provider_ids)),
         }
     }
+
+    fn learned_context_window_from_generated_profile(
+        &self,
+        active_profile_name: Option<&str>,
+        model_provider_id: &str,
+        model: Option<&str>,
+    ) -> Option<i64> {
+        if active_profile_name.is_some() {
+            return None;
+        }
+
+        let model = model?;
+        self.profiles
+            .get(generated_provider_profile_name(model_provider_id, model).as_str())
+            .and_then(|profile| profile.model_context_window)
+    }
 }
 
 /// Optional overrides for user configuration (e.g., from CLI flags).
@@ -1470,6 +1492,8 @@ impl Config {
             || config_profile.sandbox_mode.is_some()
             || cfg.sandbox_mode.is_some();
 
+        let learned_context_profile = cfg.clone();
+
         let mut model_providers = built_in_model_providers();
         // Merge user-defined providers into the built-in list.
         for (key, provider) in cfg.model_providers.into_iter() {
@@ -1489,6 +1513,32 @@ impl Config {
                 )
             })?
             .clone();
+
+        let model = model.or(config_profile.model).or_else(|| cfg.model.clone());
+        let active_generated_profile_context_window = active_profile_name
+            .as_deref()
+            .zip(model.as_deref())
+            .and_then(|(profile_name, model_name)| {
+                (profile_name
+                    == generated_provider_profile_name(&model_provider_id, model_name).as_str())
+                .then_some(config_profile.model_context_window)
+                .flatten()
+            });
+        let learned_model_context_window = learned_context_profile
+            .learned_context_window_from_generated_profile(
+                active_profile_name.as_deref(),
+                &model_provider_id,
+                model.as_deref(),
+            );
+        let learned_model_auto_compact_token_limit = active_generated_profile_context_window
+            .or(learned_model_context_window)
+            .and_then(|context_window| {
+                model.as_deref().map(|model_name| {
+                    let effective_context_window_percent =
+                        find_model_info_for_slug(model_name).effective_context_window_percent;
+                    context_window.saturating_mul(effective_context_window_percent) / 100
+                })
+            });
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
 
@@ -1545,8 +1595,6 @@ impl Config {
             });
 
         let forced_login_method = cfg.forced_login_method;
-
-        let model = model.or(config_profile.model).or(cfg.model);
 
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
@@ -1614,8 +1662,13 @@ impl Config {
         let config = Self {
             model,
             review_model,
-            model_context_window: cfg.model_context_window,
-            model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+            model_context_window: config_profile
+                .model_context_window
+                .or(cfg.model_context_window)
+                .or(learned_model_context_window),
+            model_auto_compact_token_limit: cfg
+                .model_auto_compact_token_limit
+                .or(learned_model_auto_compact_token_limit),
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -2552,6 +2605,153 @@ profile = "project"
             &SandboxPolicy::DangerFullAccess
         ));
         assert!(config.did_user_set_custom_approval_policy_or_sandbox_mode);
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_provider_profile_context_window_is_loaded_without_active_profile()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let model = "unknown-chat-model";
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            generated_provider_profile_name("openai", model),
+            ConfigProfile {
+                model: Some(model.to_string()),
+                model_provider: Some("openai".to_string()),
+                model_context_window: Some(64_000),
+                ..Default::default()
+            },
+        );
+        let cfg = ConfigToml {
+            model: Some(model.to_string()),
+            model_provider: Some("openai".to_string()),
+            profiles,
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_context_window, Some(64_000));
+        assert_eq!(config.model_auto_compact_token_limit, Some(60_800));
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_provider_profile_context_window_does_not_merge_other_profile_fields()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let model = "unknown-chat-model";
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            generated_provider_profile_name("openai", model),
+            ConfigProfile {
+                model: Some(model.to_string()),
+                model_provider: Some("openai".to_string()),
+                model_context_window: Some(64_000),
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
+        );
+        let cfg = ConfigToml {
+            model: Some(model.to_string()),
+            model_provider: Some("openai".to_string()),
+            profiles,
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_context_window, Some(64_000));
+        assert_eq!(config.model_auto_compact_token_limit, Some(60_800));
+        assert_eq!(config.approval_policy.value(), AskForApproval::OnRequest);
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_profile_context_window_takes_precedence_over_generated_profile() -> std::io::Result<()>
+    {
+        let codex_home = TempDir::new()?;
+        let model = "unknown-chat-model";
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "selected".to_string(),
+            ConfigProfile {
+                model: Some(model.to_string()),
+                model_provider: Some("openai".to_string()),
+                model_context_window: Some(96_000),
+                ..Default::default()
+            },
+        );
+        profiles.insert(
+            generated_provider_profile_name("openai", model),
+            ConfigProfile {
+                model: Some(model.to_string()),
+                model_provider: Some("openai".to_string()),
+                model_context_window: Some(64_000),
+                ..Default::default()
+            },
+        );
+        let cfg = ConfigToml {
+            model: Some(model.to_string()),
+            model_provider: Some("openai".to_string()),
+            profile: Some("selected".to_string()),
+            profiles,
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_context_window, Some(96_000));
+        assert_eq!(config.model_auto_compact_token_limit, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_generated_provider_profile_keeps_aligned_auto_compact_limit() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let model = "unknown-chat-model";
+        let profile_name = generated_provider_profile_name("openai", model);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            profile_name.clone(),
+            ConfigProfile {
+                model: Some(model.to_string()),
+                model_provider: Some("openai".to_string()),
+                model_context_window: Some(64_000),
+                ..Default::default()
+            },
+        );
+        let cfg = ConfigToml {
+            profile: Some(profile_name),
+            profiles,
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_context_window, Some(64_000));
+        assert_eq!(config.model_auto_compact_token_limit, Some(60_800));
 
         Ok(())
     }

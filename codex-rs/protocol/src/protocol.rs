@@ -1162,6 +1162,9 @@ impl TokenUsageInfo {
                 model_context_window,
             },
         };
+        if let Some(model_context_window) = model_context_window {
+            info.model_context_window = Some(model_context_window);
+        }
         if let Some(last) = last {
             info.append_last_usage(last);
         }
@@ -2713,5 +2716,42 @@ mod tests {
         };
         assert_eq!(overfull_usage.percent_of_context_window_remaining(100), 0);
         assert_eq!(overfull_usage.percent_of_context_window_remaining(0), 0);
+    }
+
+    #[test]
+    fn token_usage_info_updates_context_window_when_appending_usage() {
+        let initial = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(30_400),
+        });
+        let next = Some(TokenUsage {
+            total_tokens: 5,
+            ..TokenUsage::default()
+        });
+
+        let info =
+            TokenUsageInfo::new_or_append(&initial, &next, Some(60_800)).expect("token usage info");
+
+        assert_eq!(
+            info,
+            TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 15,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 5,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(60_800),
+            }
+        );
     }
 }

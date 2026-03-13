@@ -11,12 +11,11 @@ use codex_api::WireApi as ApiWireApi;
 use codex_api::provider::RetryConfig;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config::generated_provider_profile_name;
 use codex_core::default_client::build_reqwest_client;
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use toml_edit::value;
-
-pub(crate) const GENERATED_PROFILE_PREFIX: &str = "_provider.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ApiProviderWizardStep {
@@ -157,7 +156,7 @@ impl AuthProvider for StaticBearerAuth {
 }
 
 pub(crate) fn generated_profile_name(provider_id: &str, model: &str) -> String {
-    format!("{GENERATED_PROFILE_PREFIX}{provider_id}.{model}")
+    generated_provider_profile_name(provider_id, model)
 }
 
 pub(crate) fn current_step_value_mut(state: &mut ApiKeyInputState) -> Option<&mut String> {
