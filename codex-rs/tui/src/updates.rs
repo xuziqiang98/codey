@@ -14,7 +14,16 @@ use std::path::PathBuf;
 
 use crate::version::CODEX_CLI_VERSION;
 
+// Temporarily suppress update notifications entirely. While this remains
+// `false`, the TUI neither displays update prompts nor checks for newer
+// versions in the background.
+const SHOW_UPDATE_NOTIFICATIONS: bool = false;
+
 pub fn get_upgrade_version(config: &Config) -> Option<String> {
+    if !SHOW_UPDATE_NOTIFICATIONS {
+        return None;
+    }
+
     if !config.check_for_update_on_startup {
         return None;
     }
@@ -188,6 +197,9 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_core::config::ConfigBuilder;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_version_from_cask_contents() {
@@ -233,5 +245,33 @@ mod tests {
     fn whitespace_is_ignored() {
         assert_eq!(parse_version(" 1.2.3 \n"), Some((1, 2, 3)));
         assert_eq!(is_newer(" 1.2.3 ", "1.2.2"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn update_notifications_are_suppressed_even_when_newer_version_is_cached() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+
+        let info = VersionInfo {
+            latest_version: "999.0.0".to_string(),
+            last_checked_at: Utc::now(),
+            dismissed_version: None,
+        };
+        let version_file = codex_home.path().join(VERSION_FILENAME);
+        std::fs::write(
+            &version_file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&info).expect("serialize version info")
+            ),
+        )
+        .expect("write version file");
+
+        assert_eq!(get_upgrade_version(&config), None);
+        assert_eq!(get_upgrade_version_for_popup(&config), None);
     }
 }
